@@ -257,6 +257,40 @@ CREATE INDEX IF NOT EXISTS activity_events_owner_replay
 ON activity_events (session_id, owner_user_id, event_id)
 """
 
+_CREATE_UPLOADS_TABLE = """
+CREATE TABLE IF NOT EXISTS uploads (
+    upload_id TEXT PRIMARY KEY NOT NULL,
+    session_id TEXT NOT NULL REFERENCES workflow_sessions(session_id),
+    source_id TEXT NOT NULL UNIQUE,
+    file_name TEXT NOT NULL CHECK (
+        length(file_name) BETWEEN 1 AND 255
+        AND file_name NOT IN ('.', '..')
+        AND instr(file_name, '/') = 0
+        AND instr(file_name, '\\') = 0
+        AND instr(file_name, ':') = 0
+        AND instr(file_name, '*') = 0
+        AND instr(file_name, '?') = 0
+        AND instr(file_name, '"') = 0
+        AND instr(file_name, '<') = 0
+        AND instr(file_name, '>') = 0
+        AND instr(file_name, '|') = 0
+        AND file_name = rtrim(file_name, ' .')
+    ),
+    mime_type TEXT NOT NULL CHECK (length(mime_type) BETWEEN 1 AND 255),
+    size_bytes INTEGER NOT NULL CHECK (size_bytes > 0),
+    sha256 TEXT NOT NULL CHECK (
+        length(sha256) = 64
+        AND sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    created_at TEXT NOT NULL
+)
+"""
+
+_CREATE_UPLOADS_SESSION_INDEX = """
+CREATE INDEX IF NOT EXISTS uploads_session_created
+ON uploads (session_id, created_at, upload_id)
+"""
+
 _ACTIVITY_EVENT_COLUMNS = """session_id, event_id, owner_user_id,
 workflow_run_id, event_type, occurred_at, payload_json"""
 
@@ -416,6 +450,8 @@ class LocalSQLiteDatabase:
             await connection.execute(_CREATE_WORKFLOW_RUNS_CURRENT_INDEX)
             await connection.execute(_CREATE_ACTIVITY_EVENTS_TABLE)
             await connection.execute(_CREATE_ACTIVITY_EVENTS_REPLAY_INDEX)
+            await connection.execute(_CREATE_UPLOADS_TABLE)
+            await connection.execute(_CREATE_UPLOADS_SESSION_INDEX)
             await connection.execute(_CREATE_WORKFLOW_MESSAGES_TABLE)
             # Older local databases predate the client idempotency key; add the
             # column in place so an existing development install keeps its data.
