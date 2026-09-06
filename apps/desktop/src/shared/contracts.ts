@@ -184,14 +184,6 @@ export interface WorkflowFinding {
   citationIds: readonly string[];
 }
 
-export interface WorkflowMessage {
-  messageId: string;
-  author: "employee" | "assistant";
-  text: string;
-  createdAt?: string;
-  status?: WorkflowStatus;
-}
-
 export interface WorkflowUploadProgress {
   uploadId: string;
   fileName: string;
