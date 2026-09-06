@@ -67,6 +67,7 @@ export type ChatThreadAction =
   | { type: "sessionSynced"; threadId: ChatThreadId; session: ChatSession }
   | { type: "sendStarted"; threadId: ChatThreadId }
   | { type: "sendFailed"; threadId: ChatThreadId; message: string }
+  | { type: "sendResolved"; threadId: ChatThreadId; now: number }
   | { type: "draftCleared"; threadId: ChatThreadId; now: number };
 
 let localThreadSequence = 0;
@@ -164,6 +165,41 @@ function replaceThreads(state: ChatThreadState, threads: readonly ChatThread[]):
   return { ...state, threads, activeThreadId: fallback.id, sessionsState: "ready" };
 }
 
+/**
+ * Refresh a bound thread from backend state without discarding local state:
+ * the identifier stays stable so in-flight callbacks keep targeting this
+ * thread, and drafts, files, messages, and send state survive the refresh.
+ */
+export function mergeBackendThread(existing: ChatThread, backend: LocalChatThread): ChatThread {
+  return {
+    ...backend,
+    id: existing.id,
+    title: existing.title === "New chat" ? backend.title : existing.title,
+    draft: existing.draft,
+    attachments: existing.attachments,
+    inspectionFiles: existing.inspectionFiles,
+    messages: existing.messages,
+    messagesState: existing.messagesState,
+    sendState: existing.sendState,
+    sendError: existing.sendError,
+  };
+}
+
+/**
+ * An ambiguous append failure counts as delivered only when the stored list
+ * contains an exact employee message that the pre-send snapshot did not have.
+ */
+export function appendedMessageWasDelivered(
+  snapshot: readonly ChatMessage[],
+  stored: readonly ChatMessage[],
+  content: string,
+): boolean {
+  const snapshotIds = new Set(snapshot.map((message) => message.messageId));
+  return stored.some(
+    (message) => message.role === "user" && message.content === content && !snapshotIds.has(message.messageId),
+  );
+}
+
 export function chatThreadReducer(state: ChatThreadState, action: ChatThreadAction): ChatThreadState {
   switch (action.type) {
     case "select":
@@ -199,18 +235,29 @@ export function chatThreadReducer(state: ChatThreadState, action: ChatThreadActi
     case "sessionsLoading":
       return state.sessionsState === "loading" ? state : { ...state, sessionsState: "loading" };
     case "sessionsLoaded": {
-      // Backend sessions are the truth for bound threads. Local threads survive
-      // only while they still hold unsent content that has never reached FastAPI.
-      const exampleThread = state.threads.find((thread) => thread.source === "example");
-      const preservedThreads = state.threads.filter(
-        (thread) => thread.source === "local" && !thread.sessionId && threadHasUnsentContent(thread),
-      );
+      // Backend sessions are the truth for stage and status. Existing threads
+      // merge by session ID so unsent content and history survive a refresh.
       const backendThreads = action.sessions.map(chatThreadFromSession);
-      const boundSessionIds = new Set(backendThreads.map((thread) => thread.sessionId));
-      const keptThreads = [...(exampleThread ? [exampleThread] : []), ...preservedThreads].filter(
-        (thread) => thread.sessionId === undefined || !boundSessionIds.has(thread.sessionId),
-      );
-      const merged = orderThreads([...keptThreads, ...backendThreads]);
+      const backendBySessionId = new Map(backendThreads.map((thread) => [thread.sessionId, thread]));
+      const keptThreads: ChatThread[] = [];
+      for (const existing of state.threads) {
+        if (existing.source === "example") {
+          keptThreads.push(existing);
+          continue;
+        }
+        const backend =
+          existing.sessionId === undefined ? undefined : backendBySessionId.get(existing.sessionId);
+        if (backend) {
+          backendBySessionId.delete(backend.sessionId);
+          keptThreads.push(mergeBackendThread(existing, backend));
+          continue;
+        }
+        if (existing.sessionId === undefined && threadHasUnsentContent(existing)) {
+          keptThreads.push(existing);
+        }
+        // Stale bound threads and pristine empty threads drop out of the list.
+      }
+      const merged = orderThreads([...keptThreads, ...backendBySessionId.values()]);
       if (merged.length === 0) {
         const freshThread = createLocalChatThread(action.freshThreadId, action.now);
         return { threads: [freshThread], activeThreadId: freshThread.id, sessionsState: "ready" };
@@ -259,6 +306,12 @@ export function chatThreadReducer(state: ChatThreadState, action: ChatThreadActi
       );
     case "sendFailed":
       return updateThread(state, action.threadId, (thread) => ({ ...thread, sendState: "error", sendError: action.message }));
+    case "sendResolved":
+      return updateThread(state, action.threadId, (thread) =>
+        thread.sendState === "idle" && thread.sendError === undefined
+          ? thread
+          : { ...thread, sendState: "idle", sendError: undefined, updatedAt: action.now },
+      );
     case "draftCleared":
       return updateThread(state, action.threadId, (thread) =>
         thread.draft.length === 0 ? thread : { ...thread, draft: "", updatedAt: action.now },

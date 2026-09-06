@@ -3,6 +3,7 @@ import type { SelectedChatAttachment, SelectedUploadFile, UploadKind } from "../
 
 import { LocalApiError, localApi } from "../api/localApi";
 import {
+  appendedMessageWasDelivered,
   chatSessionTitleFromDraft,
   chatThreadReducer,
   createInitialChatThreadState,
@@ -155,10 +156,14 @@ export function useChatThreads({ apiBaseUrl, connected, examplesEnabled }: ChatT
 
       const requestSequence = (sendSequencesRef.current.get(threadId) ?? 0) + 1;
       sendSequencesRef.current.set(threadId, requestSequence);
+      const preSendMessages = thread.messages;
+      // The snapshot is trustworthy after a loaded message list, or for a
+      // session this send just created where the stored list starts empty.
+      const snapshotIsTrustworthy = thread.messagesState === "ready" || thread.sessionId === undefined;
       dispatch({ type: "sendStarted", threadId });
       void (async () => {
+        let sessionId = thread.sessionId;
         try {
-          let sessionId = thread.sessionId;
           if (sessionId === undefined) {
             const created = await localApi.createChatSession(
               { workflowType: thread.workflowType, title: chatSessionTitleFromDraft(content) },
@@ -181,6 +186,23 @@ export function useChatThreads({ apiBaseUrl, connected, examplesEnabled }: ChatT
           }
         } catch (error) {
           if (sendSequencesRef.current.get(threadId) !== requestSequence) return;
+          // An append can commit on FastAPI and still fail here. Re-read the
+          // stored list once; delivering the stored message beats duplicating
+          // it, and an unchanged list keeps the draft with the visible error.
+          if (sessionId !== undefined && snapshotIsTrustworthy) {
+            try {
+              const stored = await localApi.listChatMessages(sessionId, apiBaseUrl);
+              if (sendSequencesRef.current.get(threadId) !== requestSequence) return;
+              if (appendedMessageWasDelivered(preSendMessages, stored.messages, content)) {
+                dispatch({ type: "messagesLoaded", threadId, messages: stored.messages });
+                dispatch({ type: "draftCleared", threadId, now: Date.now() });
+                dispatch({ type: "sendResolved", threadId, now: Date.now() });
+                return;
+              }
+            } catch {
+              // Reconciliation failed too; the append error stays visible.
+            }
+          }
           dispatch({ type: "sendFailed", threadId, message: sendFailureMessage(error) });
         }
       })();

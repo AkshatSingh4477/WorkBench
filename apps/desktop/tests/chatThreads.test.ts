@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ChatMessage, ChatSession } from "../src/shared/contracts.ts";
 import {
+  appendedMessageWasDelivered,
   chatSessionTitleFromDraft,
   chatStageSteps,
   chatThreadReducer,
@@ -274,6 +275,83 @@ test("chatThreadFromSession maps the wire contract onto a thread", () => {
   assert.equal(mapped.stage, "planning");
   assert.equal(mapped.source, "local");
   assert.deepEqual(mapped.messages, []);
+});
+
+test("session refresh merges into bound threads without discarding local state", () => {
+  const bound: ChatThread = {
+    ...thread("local-1", 30),
+    sessionId: "44444444-4444-4444-8444-444444444444",
+    title: "Pump 4 seal review",
+    draft: "Unsent follow-up",
+    attachments: [{ name: "photo.png", mimeType: "image/png", sizeBytes: 9 }],
+    messages: [message("Earlier message")],
+    messagesState: "ready",
+    sendState: "sending",
+    stage: "collectingInputs",
+  };
+  const pristine = thread("pristine", 25);
+  const state = stateOf([bound, pristine], bound.id, "loading");
+  const result = chatThreadReducer(state, {
+    type: "sessionsLoaded", freshThreadId: "fresh" as ChatThreadId, now: 40,
+    sessions: [session("44444444-4444-4444-8444-444444444444", { stage: "retrieving" })],
+  });
+  assert.equal(result.threads.length, 1);
+  const merged = result.threads[0]!;
+  assert.equal(merged.id, "local-1");
+  assert.equal(merged.draft, "Unsent follow-up");
+  assert.equal(merged.attachments.length, 1);
+  assert.equal(merged.messages.length, 1);
+  assert.equal(merged.messagesState, "ready");
+  assert.equal(merged.sendState, "sending");
+  assert.equal(merged.stage, "retrieving");
+  assert.equal(merged.status, "active");
+  assert.equal(merged.title, "Pump 4 seal review");
+  assert.equal(merged.updatedAt, Date.parse("2026-09-01T10:05:00Z"));
+  assert.equal(result.activeThreadId, "local-1");
+});
+
+test("session refresh adopts the backend title only for an unrenamed new chat", () => {
+  const unnamed = { ...thread("local-1", 30), title: "New chat", sessionId: "44444444-4444-4444-8444-444444444444" };
+  const state = stateOf([unnamed], unnamed.id, "loading");
+  const result = chatThreadReducer(state, {
+    type: "sessionsLoaded", freshThreadId: "fresh" as ChatThreadId, now: 40,
+    sessions: [session("44444444-4444-4444-8444-444444444444", { title: "Backend title" })],
+  });
+  assert.equal(result.threads[0]?.title, "Backend title");
+});
+
+test("session refresh drops bound threads the backend no longer returns", () => {
+  const stale = { ...thread("stale", 30), sessionId: "55555555-5555-4555-8555-555555555555" };
+  const state = stateOf([stale], stale.id, "loading");
+  const result = chatThreadReducer(state, {
+    type: "sessionsLoaded", freshThreadId: "fresh" as ChatThreadId, now: 40,
+    sessions: [session("44444444-4444-4444-8444-444444444444")],
+  });
+  assert.equal(result.threads.length, 1);
+  assert.equal(result.threads[0]?.sessionId, "44444444-4444-4444-8444-444444444444");
+  assert.equal(result.activeThreadId, "chat-44444444-4444-4444-8444-444444444444");
+});
+
+test("ambiguous appends count as delivered only for unseen employee content", () => {
+  const stored = [message("Pump 4 seal shows scoring"), message("Second note")];
+  assert.equal(appendedMessageWasDelivered([], stored, "Pump 4 seal shows scoring"), true);
+  assert.equal(appendedMessageWasDelivered([stored[0]!], stored, "Pump 4 seal shows scoring"), false);
+  assert.equal(
+    appendedMessageWasDelivered([], [{ ...stored[0]!, role: "assistant" }], "Pump 4 seal shows scoring"),
+    false,
+  );
+  assert.equal(appendedMessageWasDelivered([], stored, "Never stored"), false);
+});
+
+test("send resolution clears an ambiguous failure exactly once", () => {
+  const first = { ...thread("first", 30), draft: "Ambiguous send", sendState: "sending" as const };
+  const state = stateOf([first], first.id);
+  const failed = chatThreadReducer(state, { type: "sendFailed", threadId: first.id, message: "The local service timed out. The message was not sent." });
+  const resolved = chatThreadReducer(failed, { type: "sendResolved", threadId: first.id, now: 40 });
+  assert.equal(resolved.threads[0]?.sendState, "idle");
+  assert.equal(resolved.threads[0]?.sendError, undefined);
+  assert.equal(resolved.threads[0]?.draft, "Ambiguous send");
+  assert.equal(chatThreadReducer(resolved, { type: "sendResolved", threadId: first.id, now: 50 }), resolved);
 });
 
 test("stage pipelines reflect active, failed, and terminal states", () => {
