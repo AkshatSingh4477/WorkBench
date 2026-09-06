@@ -56,6 +56,10 @@ export function useChatThreads({ apiBaseUrl, connected, examplesEnabled }: ChatT
   const sessionsSequenceRef = useRef(0);
   const messageSequencesRef = useRef(new Map<ChatThreadId, number>());
   const sendSequencesRef = useRef(new Map<ChatThreadId, number>());
+  // Reducer state commits a render behind the Send event, so it cannot stop
+  // two invocations in the same tick from minting two idempotency keys. This
+  // synchronous gate is authoritative for one send body per thread.
+  const inFlightSendThreadsRef = useRef(new Set<ChatThreadId>());
 
   const loadSessions = useCallback(() => {
     const requestSequence = ++sessionsSequenceRef.current;
@@ -158,6 +162,8 @@ export function useChatThreads({ apiBaseUrl, connected, examplesEnabled }: ChatT
       const content = submittedDraft.trim();
       if (content.length === 0) return;
       if (thread.status !== undefined && thread.status !== "active") return;
+      if (inFlightSendThreadsRef.current.has(threadId)) return;
+      inFlightSendThreadsRef.current.add(threadId);
 
       const requestSequence = (sendSequencesRef.current.get(threadId) ?? 0) + 1;
       sendSequencesRef.current.set(threadId, requestSequence);
@@ -215,6 +221,8 @@ export function useChatThreads({ apiBaseUrl, connected, examplesEnabled }: ChatT
             // Reconciliation failed too; the append error stays visible.
           }
           dispatch({ type: "sendFailed", threadId, message: sendFailureMessage(error), definitive: false });
+        } finally {
+          inFlightSendThreadsRef.current.delete(threadId);
         }
       })();
     },
