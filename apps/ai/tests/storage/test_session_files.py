@@ -108,10 +108,12 @@ async def test_initialize_creates_metadata_only_upload_schema(tmp_path: Path) ->
     await database.initialize()
 
     async with database.open() as connection:
-        columns = await (await connection.execute("PRAGMA table_info(uploads)")).fetchall()
+        columns = await (
+            await connection.execute("PRAGMA table_info(workflow_uploads)")
+        ).fetchall()
         foreign_keys = list(
             await (
-                await connection.execute("PRAGMA foreign_key_list(uploads)")
+                await connection.execute("PRAGMA foreign_key_list(workflow_uploads)")
             ).fetchall()
         )
 
@@ -120,6 +122,7 @@ async def test_initialize_creates_metadata_only_upload_schema(tmp_path: Path) ->
         "upload_id",
         "session_id",
         "source_id",
+        "stored_file_name",
         "file_name",
         "mime_type",
         "size_bytes",
@@ -128,7 +131,7 @@ async def test_initialize_creates_metadata_only_upload_schema(tmp_path: Path) ->
     ]
     assert not {"content", "bytes", "path", "url"}.intersection(names)
     assert foreign_keys[0]["table"] == "workflow_sessions"
-    assert foreign_keys[0]["on_delete"] == "NO ACTION"
+    assert foreign_keys[0]["on_delete"] == "CASCADE"
 
 
 @pytest.mark.asyncio
@@ -441,7 +444,7 @@ async def test_database_failure_removes_promoted_file(tmp_path: Path) -> None:
     upload_id = uuid4()
     async with database.open() as connection:
         await connection.execute(
-            """CREATE TRIGGER reject_upload BEFORE INSERT ON uploads
+            """CREATE TRIGGER reject_upload BEFORE INSERT ON workflow_uploads
             BEGIN SELECT RAISE(ABORT, 'test failure'); END"""
         )
 

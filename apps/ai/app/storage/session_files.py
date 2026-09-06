@@ -19,12 +19,13 @@ from app.storage.session_workspace import (
     _validate_file_name,
 )
 from app.storage.sqlite import LocalSQLiteDatabase
-from app.workflow.contracts import WorkflowSession
+from app.workflow.contracts import WorkflowSession, WorkflowStage
 
 _MEBIBYTE = 1024 * 1024
-_UPLOAD_COLUMNS = """uploads.upload_id, uploads.session_id, uploads.source_id,
-uploads.file_name, uploads.mime_type, uploads.size_bytes, uploads.sha256,
-uploads.created_at"""
+_UPLOAD_COLUMNS = """workflow_uploads.upload_id, workflow_uploads.session_id,
+workflow_uploads.source_id, workflow_uploads.stored_file_name,
+workflow_uploads.file_name, workflow_uploads.mime_type, workflow_uploads.size_bytes,
+workflow_uploads.sha256, workflow_uploads.created_at"""
 
 
 class UploadAlreadyExistsError(RuntimeError):
@@ -33,6 +34,10 @@ class UploadAlreadyExistsError(RuntimeError):
 
 class SessionFileContextMismatchError(PermissionError):
     """Raised when upload mutation does not match an owned workflow session."""
+
+
+class UploadSessionStateConflictError(SessionFileContextMismatchError):
+    """The workflow session changed before an upload could be committed."""
 
 
 class UploadIntegrityError(RuntimeError):
@@ -48,7 +53,7 @@ class SessionUploadCleanupError(RuntimeError):
         self.failed_count = failed_count
 
 
-class LocalSessionFileStore:
+class SQLiteSessionFileStore:
     """Stream session uploads locally and expose only owner-approved exact paths."""
 
     def __init__(
@@ -114,7 +119,7 @@ class LocalSessionFileStore:
                 sha256=sha256,
                 created_at=datetime.now(UTC),
             )
-            destination = self._upload_path(session.session_id, upload_id)
+            destination = self._upload_path(session.session_id, f"{upload_id}.upload")
 
             stored: StoredUpload | None = None
             async with self._database.open() as connection:
@@ -140,14 +145,15 @@ class LocalSessionFileStore:
                         ) from error
                     promoted = True
                     await connection.execute(
-                        """INSERT INTO uploads
-                        (upload_id, session_id, source_id, file_name, mime_type,
-                         size_bytes, sha256, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        """INSERT INTO workflow_uploads
+                        (upload_id, session_id, source_id, stored_file_name, file_name,
+                         mime_type, size_bytes, sha256, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
                             str(candidate.upload_id),
                             str(candidate.session_id),
                             str(candidate.source_id),
+                            destination.name,
                             candidate.file_name,
                             candidate.mime_type,
                             candidate.size_bytes,
@@ -182,7 +188,7 @@ class LocalSessionFileStore:
         async with self._database.open() as connection:
             cursor = await connection.execute(
                 f"""SELECT {_UPLOAD_COLUMNS}
-                FROM uploads
+                FROM workflow_uploads
                 JOIN workflow_sessions USING (session_id)
                 WHERE upload_id = ? AND session_id = ? AND owner_user_id = ?""",
                 (str(upload_id), str(session_id), str(owner_user_id)),
@@ -199,14 +205,18 @@ class LocalSessionFileStore:
     ) -> ApprovedPath | None:
         """Resolve one owned upload after checking its current file integrity."""
 
-        upload = await self.get_upload(
-            upload_id=upload_id,
-            session_id=session_id,
-            owner_user_id=owner_user_id,
-        )
-        if upload is None:
+        async with self._database.open() as connection:
+            cursor = await connection.execute(
+                f"""SELECT {_UPLOAD_COLUMNS} FROM workflow_uploads
+                JOIN workflow_sessions USING (session_id)
+                WHERE upload_id = ? AND session_id = ? AND owner_user_id = ?""",
+                (str(upload_id), str(session_id), str(owner_user_id)),
+            )
+            row = await cursor.fetchone()
+        if row is None:
             return None
-        path = self._verify_upload_file(upload)
+        upload = self._upload_from_row(row)
+        path = self._verify_upload_file(upload, row["stored_file_name"])
         return ApprovedPath(
             path=path,
             source_id=str(upload.source_id),
@@ -228,17 +238,18 @@ class LocalSessionFileStore:
                 owner_user_id=owner_user_id,
             )
             cursor = await connection.execute(
-                f"""SELECT {_UPLOAD_COLUMNS} FROM uploads
+                f"""SELECT {_UPLOAD_COLUMNS} FROM workflow_uploads
                 WHERE session_id = ? ORDER BY created_at, upload_id""",
                 (str(session_id),),
             )
-            uploads = [self._upload_from_row(row) for row in await cursor.fetchall()]
+            rows = await cursor.fetchall()
 
         removable: list[UUID] = []
         failed_count = 0
-        for upload in uploads:
+        for row in rows:
+            upload = self._upload_from_row(row)
             try:
-                path = self._upload_path(session_id, upload.upload_id)
+                path = self._upload_path(session_id, row["stored_file_name"])
                 if path.exists():
                     if not path.is_file():
                         raise UploadIntegrityError(
@@ -261,11 +272,11 @@ class LocalSessionFileStore:
                 )
                 for upload_id in removable:
                     cursor = await connection.execute(
-                        """DELETE FROM uploads
+                        """DELETE FROM workflow_uploads
                         WHERE upload_id = ? AND session_id = ?
                           AND EXISTS (
                               SELECT 1 FROM workflow_sessions
-                              WHERE workflow_sessions.session_id = uploads.session_id
+                              WHERE workflow_sessions.session_id = workflow_uploads.session_id
                                 AND workflow_sessions.owner_user_id = ?
                           )""",
                         (str(upload_id), str(session_id), str(owner_user_id)),
@@ -290,16 +301,17 @@ class LocalSessionFileStore:
     ) -> None:
         cursor = await connection.execute(
             """SELECT 1 FROM workflow_sessions
-            WHERE session_id = ? AND owner_user_id = ? AND workflow_type = ?""",
+            WHERE session_id = ? AND owner_user_id = ? AND workflow_type = ? AND stage = ?""",
             (
                 str(session.session_id),
                 str(session.owner_user_id),
                 session.workflow_type.value,
+                WorkflowStage.COLLECTING_INPUTS.value,
             ),
         )
         if await cursor.fetchone() is None:
-            raise SessionFileContextMismatchError(
-                "upload does not match an existing owned workflow session"
+            raise UploadSessionStateConflictError(
+                "workflow session no longer accepts this upload"
             )
 
     @staticmethod
@@ -346,9 +358,13 @@ class LocalSessionFileStore:
             raise
         return size_bytes, digest.hexdigest()
 
-    def _verify_upload_file(self, upload: StoredUpload) -> Path:
+    def _verify_upload_file(
+        self, upload: StoredUpload, stored_file_name: str | None = None
+    ) -> Path:
         try:
-            path = self._upload_path(upload.session_id, upload.upload_id)
+            path = self._upload_path(
+                upload.session_id, stored_file_name or f"{upload.upload_id}.upload"
+            )
             if not path.is_file():
                 raise UploadIntegrityError("controlled upload file is missing")
             stat = path.stat()
@@ -362,11 +378,11 @@ class LocalSessionFileStore:
         except WorkspacePathError as error:
             raise UploadIntegrityError("controlled upload path is unsafe") from error
 
-    def _upload_path(self, session_id: UUID, upload_id: UUID) -> Path:
+    def _upload_path(self, session_id: UUID, stored_file_name: str) -> Path:
         return self._workspaces.file_path(
             str(session_id),
             WorkspaceArea.UPLOADS,
-            f"{upload_id}.upload",
+            stored_file_name,
         )
 
     @staticmethod
@@ -377,12 +393,12 @@ class LocalSessionFileStore:
         source_id: UUID,
     ) -> StoredUpload | None:
         cursor = await connection.execute(
-            f"""SELECT {_UPLOAD_COLUMNS} FROM uploads
+            f"""SELECT {_UPLOAD_COLUMNS} FROM workflow_uploads
             WHERE upload_id = ? OR source_id = ?""",
             (str(upload_id), str(source_id)),
         )
         row = await cursor.fetchone()
-        return LocalSessionFileStore._upload_from_row(row) if row is not None else None
+        return SQLiteSessionFileStore._upload_from_row(row) if row is not None else None
 
     @staticmethod
     def _same_upload(existing: StoredUpload, candidate: StoredUpload) -> bool:
@@ -416,3 +432,7 @@ class LocalSessionFileStore:
             for chunk in iter(lambda: source.read(1024 * 1024), b""):
                 digest.update(chunk)
         return digest.hexdigest()
+
+
+# Compatibility name retained for the feature branch's focused storage callers.
+LocalSessionFileStore = SQLiteSessionFileStore

@@ -4,8 +4,10 @@ from app.storage.session_files import (
     LocalSessionFileStore,
     SessionFileContextMismatchError,
     SessionUploadCleanupError,
+    SQLiteSessionFileStore,
     UploadAlreadyExistsError,
     UploadIntegrityError,
+    UploadSessionStateConflictError,
 )
 from app.storage.session_workspace import (
     LocalSessionWorkspaceStore,
@@ -48,6 +50,7 @@ __all__ = [
     "SQLiteAuditStore",
     "SQLiteAuthSessionStore",
     "SQLiteIdentityStore",
+    "SQLiteSessionFileStore",
     "SQLiteSessionMetadataStore",
     "SQLiteWorkflowStore",
     "SessionAlreadyExistsError",
@@ -57,6 +60,7 @@ __all__ = [
     "SessionWorkspace",
     "UploadAlreadyExistsError",
     "UploadIntegrityError",
+    "UploadSessionStateConflictError",
     "WorkflowRunAlreadyExistsError",
     "WorkflowRunContextMismatchError",
     "WorkflowSessionNotFoundError",
