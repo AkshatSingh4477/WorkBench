@@ -222,6 +222,23 @@ test("message loads transition idle, loading, ready, and error without touching 
   assert.equal(chatThreadReducer(state, { type: "messagesLoaded", threadId: "unknown" as ChatThreadId, messages: [] }), state);
 });
 
+test("a stale message load keeps sends that completed after its snapshot", () => {
+  const bound = { ...thread("bound", 30), sessionId: "33333333-3333-4333-8333-333333333333", messagesState: "loading" as const };
+  const older = message("Earlier message", "2026-09-01T10:05:00Z");
+  const sent = { ...message("Sent during load", "2026-09-01T10:06:00Z"), messageId: "33333333-3333-4333-8333-333333333331" };
+  const state = stateOf([bound], bound.id);
+
+  const appended = chatThreadReducer(state, { type: "messageAppended", threadId: bound.id, message: sent, now: 40 });
+  const loaded = chatThreadReducer(appended, { type: "messagesLoaded", threadId: bound.id, messages: [older] });
+  // The snapshot predates the append, so the sent message survives the load.
+  assert.deepEqual(loaded.threads[0]?.messages, [older, sent]);
+  assert.equal(loaded.threads[0]?.messagesState, "ready");
+
+  // A snapshot that already includes the sent message does not duplicate it.
+  const refetched = chatThreadReducer(loaded, { type: "messagesLoaded", threadId: bound.id, messages: [older, sent] });
+  assert.deepEqual(refetched.threads[0]?.messages, [older, sent]);
+});
+
 test("session binding adopts the backend title only for a new chat", () => {
   const fresh = thread("local-1", 30);
   fresh.title = "New chat";

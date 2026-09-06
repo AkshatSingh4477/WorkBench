@@ -207,6 +207,26 @@ export function findDeliveredMessage(
   return stored.find((message) => message.clientMessageId === clientMessageId);
 }
 
+/**
+ * Merge a fetched message list into the local conversation. The backend
+ * store is append-only, so absence from an older snapshot is not deletion:
+ * a send that completed while the list request was in flight stays in the
+ * merged array. Fetching without local extras preserves the server order.
+ */
+export function mergeLoadedMessages(
+  local: readonly ChatMessage[],
+  fetched: readonly ChatMessage[],
+): readonly ChatMessage[] {
+  const fetchedIds = new Set(fetched.map((message) => message.messageId));
+  const extras = local.filter((message) => !fetchedIds.has(message.messageId));
+  if (extras.length === 0) return fetched;
+  return [...fetched, ...extras].sort(
+    (left, right) =>
+      Date.parse(left.createdAt) - Date.parse(right.createdAt) ||
+      left.messageId.localeCompare(right.messageId),
+  );
+}
+
 export function chatThreadReducer(state: ChatThreadState, action: ChatThreadAction): ChatThreadState {
   switch (action.type) {
     case "select":
@@ -290,7 +310,11 @@ export function chatThreadReducer(state: ChatThreadState, action: ChatThreadActi
         thread.messagesState === "loading" ? thread : { ...thread, messagesState: "loading" },
       );
     case "messagesLoaded":
-      return updateThread(state, action.threadId, (thread) => ({ ...thread, messages: action.messages, messagesState: "ready" }));
+      return updateThread(state, action.threadId, (thread) => ({
+        ...thread,
+        messages: mergeLoadedMessages(thread.messages, action.messages),
+        messagesState: "ready",
+      }));
     case "messagesFailed":
       return updateThread(state, action.threadId, (thread) =>
         thread.messagesState === "loading" ? { ...thread, messagesState: "error" } : thread,
