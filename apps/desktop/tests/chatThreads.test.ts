@@ -313,6 +313,7 @@ test("session refresh merges into bound threads without discarding local state",
   assert.equal(merged.status, "active");
   assert.equal(merged.title, "Pump 4 seal review");
   assert.equal(merged.updatedAt, Date.parse("2026-09-01T10:05:00Z"));
+  assert.equal(merged.seenInSessions, true);
   assert.equal(result.activeThreadId, "local-1");
 });
 
@@ -335,7 +336,7 @@ test("session refresh keeps bound threads with live send or unsent state", () =>
     messages: [message("Earlier message")],
   };
   const drafted = { ...thread("drafted", 25), sessionId: "77777777-7777-4777-8777-777777777777", draft: "Retry text" };
-  const stale = { ...thread("stale", 20), sessionId: "88888888-8888-4888-8888-888888888888" };
+  const stale = { ...thread("stale", 20), sessionId: "88888888-8888-4888-8888-888888888888", seenInSessions: true };
   const state = stateOf([sending, drafted, stale], sending.id, "loading");
   const result = chatThreadReducer(state, {
     type: "sessionsLoaded", freshThreadId: "fresh" as ChatThreadId, now: 40,
@@ -348,8 +349,62 @@ test("session refresh keeps bound threads with live send or unsent state", () =>
   assert.equal(result.activeThreadId, sending.id);
 });
 
+test("a stale session list keeps a bound thread that was never listed", () => {
+  // Reproduces the review race: the list was captured before the first bind,
+  // and the append already completed, so the thread is idle with no draft.
+  const bound: ChatThread = {
+    ...thread("local-1", 30),
+    title: "Pump 4 seal review",
+    sessionId: "66666666-6666-4666-8666-666666666666",
+    messages: [message("First stored message")],
+    messagesState: "ready",
+  };
+  const state = stateOf([bound], bound.id, "loading");
+  const loaded = chatThreadReducer(state, {
+    type: "sessionsLoaded", freshThreadId: "fresh" as ChatThreadId, now: 40,
+    sessions: [session("44444444-4444-4444-8444-444444444444")],
+  });
+  const kept = loaded.threads.find((candidate) => candidate.id === bound.id);
+  assert.ok(kept);
+  assert.equal(kept.messages.length, 1);
+  assert.equal(loaded.activeThreadId, bound.id);
+
+  // The pending stage sync must still reach the surviving thread.
+  const synced = chatThreadReducer(loaded, {
+    type: "sessionSynced", threadId: bound.id,
+    session: session("66666666-6666-4666-8666-666666666666", { stage: "extracting", updatedAt: "2026-09-01T10:08:00Z" }),
+  });
+  assert.equal(synced.threads.find((candidate) => candidate.id === bound.id)?.stage, "extracting");
+});
+
+test("a listed bound thread absent from a later refresh leaves the list", () => {
+  const removed = { ...thread("removed", 30), sessionId: "55555555-5555-4555-8555-555555555555", seenInSessions: true };
+  const state = stateOf([removed], removed.id, "loading");
+  const result = chatThreadReducer(state, {
+    type: "sessionsLoaded", freshThreadId: "fresh" as ChatThreadId, now: 40,
+    sessions: [session("44444444-4444-4444-8444-444444444444")],
+  });
+  assert.equal(result.threads.length, 1);
+  assert.equal(result.threads[0]?.sessionId, "44444444-4444-4444-8444-444444444444");
+});
+
+test("a listed bound thread with unsent content survives a refresh that omits it", () => {
+  const drafted = {
+    ...thread("drafted", 30),
+    sessionId: "55555555-5555-4555-8555-555555555555",
+    seenInSessions: true,
+    draft: "Unsent note",
+  };
+  const state = stateOf([drafted], drafted.id, "loading");
+  const result = chatThreadReducer(state, {
+    type: "sessionsLoaded", freshThreadId: "fresh" as ChatThreadId, now: 40,
+    sessions: [session("44444444-4444-4444-8444-444444444444")],
+  });
+  assert.ok(result.threads.some((candidate) => candidate.id === drafted.id));
+});
+
 test("session refresh drops bound threads the backend no longer returns", () => {
-  const stale = { ...thread("stale", 30), sessionId: "55555555-5555-4555-8555-555555555555" };
+  const stale = { ...thread("stale", 30), sessionId: "55555555-5555-4555-8555-555555555555", seenInSessions: true };
   const state = stateOf([stale], stale.id, "loading");
   const result = chatThreadReducer(state, {
     type: "sessionsLoaded", freshThreadId: "fresh" as ChatThreadId, now: 40,

@@ -32,6 +32,8 @@ interface ChatThreadFields {
   messagesState: ChatMessagesState;
   sendState: ChatSendState;
   sendError?: string;
+  /** True once a completed session list has included this session. */
+  seenInSessions?: boolean;
 }
 
 export interface LocalChatThread extends ChatThreadFields {
@@ -98,6 +100,7 @@ export function chatThreadFromSession(session: ChatSession): LocalChatThread {
     messages: [],
     messagesState: "idle",
     sendState: "idle",
+    seenInSessions: true,
     createdAt: Date.parse(session.createdAt),
     updatedAt: Date.parse(session.updatedAt),
   };
@@ -255,13 +258,22 @@ export function chatThreadReducer(state: ChatThreadState, action: ChatThreadActi
           keptThreads.push(mergeBackendThread(existing, backend));
           continue;
         }
-        // Keep threads with unsent content or an in-flight send: a session
-        // list captured before a concurrent first bind must not erase live
-        // renderer state or strand its pending append callback.
-        if (threadHasUnsentContent(existing) || existing.sendState === "sending") {
+        if (existing.sessionId !== undefined) {
+          // A list captured before a concurrent first bind predates the
+          // session, so absence alone is not proof of removal. A bound
+          // thread leaves the list only after a completed list previously
+          // included it and it holds no live send or unsent content.
+          const hasLiveState = threadHasUnsentContent(existing) || existing.sendState === "sending";
+          if (existing.seenInSessions === true && !hasLiveState) {
+            continue;
+          }
+          keptThreads.push(existing);
+          continue;
+        }
+        // Unbound threads survive a refresh only while they hold unsent content.
+        if (threadHasUnsentContent(existing)) {
           keptThreads.push(existing);
         }
-        // Stale bound threads and pristine empty threads drop out of the list.
       }
       const merged = orderThreads([...keptThreads, ...backendBySessionId.values()]);
       if (merged.length === 0) {
