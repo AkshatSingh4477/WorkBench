@@ -1,6 +1,7 @@
 """Focused API tests for authenticated workflow-session creation."""
 
 import asyncio
+from collections.abc import AsyncGenerator
 from datetime import datetime
 from pathlib import Path
 from typing import cast
@@ -17,7 +18,7 @@ from app.health import ApplicationDependencies
 from app.main import create_app
 from app.ports.backend2 import AuditRecord, AuthSessionRecord, StoredIdentity, WorkflowStore
 from app.storage import LocalSQLiteDatabase
-from app.workflow.contracts import WorkflowSession, WorkflowType
+from app.workflow.contracts import ActivityEvent, WorkflowSession, WorkflowType
 
 _CAPABILITY = "c" * 43
 _ORIGIN = "http://127.0.0.1:5173"
@@ -75,6 +76,38 @@ class _AuditStore:
         self.records.append(record)
 
 
+class _EventStore:
+    def __init__(self) -> None:
+        self.events: list[ActivityEvent] = []
+
+    async def append(
+        self, event: ActivityEvent, *, owner_user_id: UUID
+    ) -> ActivityEvent:
+        del owner_user_id
+        stored = event.model_copy(update={"event_id": len(self.events) + 1})
+        self.events.append(stored)
+        return stored
+
+    async def replay(
+        self, *, session_id: UUID, owner_user_id: UUID, after_event_id: int
+    ) -> list[ActivityEvent]:
+        del owner_user_id
+        return [
+            event
+            for event in self.events
+            if event.session_id == session_id and event.event_id > after_event_id
+        ]
+
+    async def subscribe(
+        self, *, session_id: UUID, owner_user_id: UUID, after_event_id: int
+    ) -> AsyncGenerator[ActivityEvent, None]:
+        del session_id, owner_user_id, after_event_id
+        while True:
+            await asyncio.sleep(3600)
+            if self.events:
+                yield self.events[-1]
+
+
 class _WorkflowStore:
     def __init__(self) -> None:
         self.sessions: list[WorkflowSession] = []
@@ -94,9 +127,10 @@ def _headers(*, origin: str | None = _ORIGIN) -> dict[str, str]:
     return headers
 
 
-def _client() -> tuple[TestClient, _WorkflowStore, _AuditStore]:
+def _client() -> tuple[TestClient, _WorkflowStore, _AuditStore, _EventStore]:
     workflow_store = _WorkflowStore()
     audit_store = _AuditStore()
+    event_store = _EventStore()
     app = create_app(
         settings=ApplicationSettings(
             auth_signing_secret=_SECRET,
@@ -108,9 +142,10 @@ def _client() -> tuple[TestClient, _WorkflowStore, _AuditStore]:
             auth_session_store=_AuthSessionStore(),
             audit_store=audit_store,
             workflow_store=cast(WorkflowStore, workflow_store),
+            activity_event_store=event_store,
         ),
     )
-    return TestClient(app), workflow_store, audit_store
+    return TestClient(app), workflow_store, audit_store, event_store
 
 
 def _login(client: TestClient) -> str:
@@ -126,7 +161,7 @@ def _login(client: TestClient) -> str:
 
 
 def test_creates_both_workflow_types_with_public_initial_state_and_audit() -> None:
-    client, workflow_store, audit_store = _client()
+    client, workflow_store, audit_store, event_store = _client()
 
     with client:
         _login(client)
@@ -173,10 +208,14 @@ def test_creates_both_workflow_types_with_public_initial_state_and_audit() -> No
     assert created_audits[0].actor_user_id == workflow_store.sessions[0].owner_user_id
     assert created_audits[0].session_id == workflow_store.sessions[0].session_id
     assert created_audits[0].workflow_run_id is None
+    assert [event.event_type.value for event in event_store.events] == [
+        "session.created",
+        "session.created",
+    ]
 
 
 def test_rejects_unauthenticated_and_untrusted_origin_requests() -> None:
-    client, workflow_store, _ = _client()
+    client, workflow_store, _, _ = _client()
 
     with client:
         unauthenticated = client.post(
@@ -199,7 +238,7 @@ def test_rejects_unauthenticated_and_untrusted_origin_requests() -> None:
 
 
 def test_validates_title_workflow_type_and_unknown_fields() -> None:
-    client, workflow_store, _ = _client()
+    client, workflow_store, _, _ = _client()
 
     with client:
         _login(client)
@@ -238,7 +277,7 @@ def test_validates_title_workflow_type_and_unknown_fields() -> None:
 
 
 def test_returns_sanitized_store_error_and_keeps_creation_when_audit_is_down() -> None:
-    client, workflow_store, audit_store = _client()
+    client, workflow_store, audit_store, _ = _client()
 
     with client:
         _login(client)

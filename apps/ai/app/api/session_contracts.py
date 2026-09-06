@@ -36,3 +36,16 @@ class WorkflowSessionCreateResponse(ApiContractModel):
     stage: WorkflowStage
     status: WorkflowStatus
     created_at: UtcTimestamp
+
+
+class WorkflowUploadResponse(ApiContractModel):
+    """Safe metadata for one explicit local input, without its filesystem path."""
+
+    upload_id: UUID
+    session_id: UUID
+    file_name: str = Field(min_length=1, max_length=255)
+    mime_type: str = Field(min_length=1, max_length=255)
+    size_bytes: int = Field(ge=1)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_id: UUID
+    created_at: UtcTimestamp

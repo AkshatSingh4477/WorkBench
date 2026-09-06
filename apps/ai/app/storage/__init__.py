@@ -1,5 +1,6 @@
 """Local persistence implementations owned by Backend 2."""
 
+from app.storage.session_files import SQLiteSessionFileStore
 from app.storage.session_workspace import (
     LocalSessionWorkspaceStore,
     SessionWorkspace,
@@ -40,6 +41,7 @@ __all__ = [
     "SQLiteAuditStore",
     "SQLiteAuthSessionStore",
     "SQLiteIdentityStore",
+    "SQLiteSessionFileStore",
     "SQLiteSessionMetadataStore",
     "SQLiteWorkflowStore",
     "SessionAlreadyExistsError",

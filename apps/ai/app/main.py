@@ -21,10 +21,13 @@ from app.auth.service import AuthError, AuthService
 from app.config import ApplicationSettings
 from app.health import ApplicationDependencies, build_health_response
 from app.storage import (
+    LocalSessionWorkspaceStore,
     LocalSQLiteDatabase,
+    SQLiteActivityEventStore,
     SQLiteAuditStore,
     SQLiteAuthSessionStore,
     SQLiteIdentityStore,
+    SQLiteSessionFileStore,
     SQLiteWorkflowStore,
 )
 
@@ -95,6 +98,10 @@ def compose_runtime_dependencies(settings: ApplicationSettings) -> ApplicationDe
         audit_store=SQLiteAuditStore(database),
         chat_store=workflow_store,
         workflow_store=workflow_store,
+        session_file_store=SQLiteSessionFileStore(
+            database, LocalSessionWorkspaceStore(settings.sessions_root)
+        ),
+        activity_event_store=SQLiteActivityEventStore(database),
         startup=database.initialize,
     )
 
@@ -183,6 +190,9 @@ def create_app(
     )
     application.state.chat_store = resolved_dependencies.chat_store
     application.state.workflow_store = resolved_dependencies.workflow_store
+    application.state.session_file_store = resolved_dependencies.session_file_store
+    application.state.activity_event_store = resolved_dependencies.activity_event_store
+    application.state.upload_max_bytes = resolved_settings.upload_max_bytes
     application.add_exception_handler(RequestValidationError, _validation_error_handler)
     application.add_exception_handler(AuthError, _auth_error_handler)
     application.add_exception_handler(Exception, _unhandled_error_handler)
