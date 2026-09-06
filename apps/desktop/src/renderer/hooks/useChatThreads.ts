@@ -3,11 +3,11 @@ import type { SelectedChatAttachment, SelectedUploadFile, UploadKind } from "../
 
 import { LocalApiError, localApi } from "../api/localApi";
 import {
-  appendedMessageWasDelivered,
   chatSessionTitleFromDraft,
   chatThreadReducer,
   createInitialChatThreadState,
   createThreadId,
+  findDeliveredMessage,
   type ChatThread,
   type ChatThreadId,
   type ChatThreadState,
@@ -157,11 +157,10 @@ export function useChatThreads({ apiBaseUrl, connected, examplesEnabled }: ChatT
       const requestSequence = (sendSequencesRef.current.get(threadId) ?? 0) + 1;
       sendSequencesRef.current.set(threadId, requestSequence);
       const submittedDraft = thread.draft;
-      const preSendMessages = thread.messages;
-      // The snapshot is trustworthy after a loaded message list, or for a
-      // session this send just created where the stored list starts empty.
-      const snapshotIsTrustworthy = thread.messagesState === "ready" || thread.sessionId === undefined;
-      dispatch({ type: "sendStarted", threadId });
+      // One idempotency key per unresolved append: retries of the same send
+      // reuse it, so FastAPI can never store the message twice.
+      const clientMessageId = thread.pendingClientMessageId ?? globalThis.crypto.randomUUID();
+      dispatch({ type: "sendStarted", threadId, clientMessageId });
       void (async () => {
         let sessionId = thread.sessionId;
         try {
@@ -174,7 +173,11 @@ export function useChatThreads({ apiBaseUrl, connected, examplesEnabled }: ChatT
             dispatch({ type: "sessionBound", threadId, session: created });
             sessionId = created.sessionId;
           }
-          const message = await localApi.appendChatMessage(sessionId, { content }, apiBaseUrl);
+          const message = await localApi.appendChatMessage(
+            sessionId,
+            { content, clientMessageId },
+            apiBaseUrl,
+          );
           if (sendSequencesRef.current.get(threadId) !== requestSequence) return;
           dispatch({ type: "messageAppended", threadId, message, now: Date.now() });
           dispatch({ type: "draftClearedIfUnchanged", threadId, draft: submittedDraft, now: Date.now() });
@@ -187,24 +190,29 @@ export function useChatThreads({ apiBaseUrl, connected, examplesEnabled }: ChatT
           }
         } catch (error) {
           if (sendSequencesRef.current.get(threadId) !== requestSequence) return;
-          // An append can commit on FastAPI and still fail here. Re-read the
-          // stored list once; delivering the stored message beats duplicating
-          // it, and an unchanged list keeps the draft with the visible error.
-          if (sessionId !== undefined && snapshotIsTrustworthy) {
+          // An append can commit on FastAPI and still fail here. The key
+          // decides, not content: the stored list either contains this
+          // exact request (delivered) or a successful read proves it was
+          // never stored (definitively failed, key released). A failed
+          // reconciliation read keeps both draft and key for a safe retry.
+          if (sessionId !== undefined) {
             try {
               const stored = await localApi.listChatMessages(sessionId, apiBaseUrl);
               if (sendSequencesRef.current.get(threadId) !== requestSequence) return;
-              if (appendedMessageWasDelivered(preSendMessages, stored.messages, content)) {
+              const delivered = findDeliveredMessage(stored.messages, clientMessageId);
+              if (delivered !== undefined) {
                 dispatch({ type: "messagesLoaded", threadId, messages: stored.messages });
                 dispatch({ type: "draftClearedIfUnchanged", threadId, draft: submittedDraft, now: Date.now() });
                 dispatch({ type: "sendResolved", threadId, now: Date.now() });
                 return;
               }
+              dispatch({ type: "sendFailed", threadId, message: sendFailureMessage(error), definitive: true });
+              return;
             } catch {
               // Reconciliation failed too; the append error stays visible.
             }
           }
-          dispatch({ type: "sendFailed", threadId, message: sendFailureMessage(error) });
+          dispatch({ type: "sendFailed", threadId, message: sendFailureMessage(error), definitive: sessionId === undefined });
         }
       })();
     },

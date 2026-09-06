@@ -241,6 +241,8 @@ export const chatMessageSchema = z.strictObject({
   role: chatMessageRoleSchema,
   content: z.string().min(1).max(20_000),
   createdAt: chatTimestampSchema,
+  /** The renderer idempotency key; null for messages stored before the key existed. */
+  clientMessageId: uuidSchema.nullable(),
 });
 
 export const chatSessionListResponseSchema = z.strictObject({
@@ -266,6 +268,8 @@ export const chatMessageAppendRequestSchema = z.strictObject({
     .min(1)
     .max(20_000)
     .refine((content) => content.trim().length > 0, { message: "content must not be blank" }),
+  /** Stable per-attempt idempotency key; retries reuse it instead of duplicating. */
+  clientMessageId: uuidSchema,
 });
 
 /** The renderer may build paths only from server-issued session IDs. */

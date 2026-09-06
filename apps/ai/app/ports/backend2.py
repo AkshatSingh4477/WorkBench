@@ -63,6 +63,8 @@ class WorkflowMessage(ApiContractModel):
     role: str = Field(pattern="^(user|assistant)$")
     content: str = Field(min_length=1, max_length=20_000)
     created_at: UtcTimestamp
+    # Client-supplied idempotency key; null only for messages stored before the key existed.
+    client_message_id: UUID | None = None
 
 
 class StoredUpload(ApiContractModel):

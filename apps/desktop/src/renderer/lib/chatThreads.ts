@@ -32,6 +32,8 @@ interface ChatThreadFields {
   messagesState: ChatMessagesState;
   sendState: ChatSendState;
   sendError?: string;
+  /** Client idempotency key of an unresolved append; retries reuse it. */
+  pendingClientMessageId?: string;
   /** True once a completed session list has included this session. */
   seenInSessions?: boolean;
 }
@@ -67,8 +69,8 @@ export type ChatThreadAction =
   | { type: "sessionBound"; threadId: ChatThreadId; session: ChatSession }
   | { type: "messageAppended"; threadId: ChatThreadId; message: ChatMessage; now: number }
   | { type: "sessionSynced"; threadId: ChatThreadId; session: ChatSession }
-  | { type: "sendStarted"; threadId: ChatThreadId }
-  | { type: "sendFailed"; threadId: ChatThreadId; message: string }
+  | { type: "sendStarted"; threadId: ChatThreadId; clientMessageId: string }
+  | { type: "sendFailed"; threadId: ChatThreadId; message: string; definitive: boolean }
   | { type: "sendResolved"; threadId: ChatThreadId; now: number }
   | { type: "draftClearedIfUnchanged"; threadId: ChatThreadId; draft: string; now: number };
 
@@ -185,25 +187,20 @@ export function mergeBackendThread(existing: ChatThread, backend: LocalChatThrea
     messagesState: existing.messagesState,
     sendState: existing.sendState,
     sendError: existing.sendError,
+    pendingClientMessageId: existing.pendingClientMessageId,
   };
 }
 
-/** An append counts as delivered only when the stored list ends with an unseen
- * employee message whose content matches this request. Matching any position
- * would misattribute an older identical message to a failed append. */
-export function appendedMessageWasDelivered(
-  snapshot: readonly ChatMessage[],
+/**
+ * The stored message that resolves one append attempt, found by its
+ * client idempotency key. Content never identifies a message: two
+ * identical texts are different appends.
+ */
+export function findDeliveredMessage(
   stored: readonly ChatMessage[],
-  content: string,
-): boolean {
-  const last = stored[stored.length - 1];
-  const snapshotIds = new Set(snapshot.map((message) => message.messageId));
-  return (
-    last !== undefined &&
-    last.role === "user" &&
-    last.content === content &&
-    !snapshotIds.has(last.messageId)
-  );
+  clientMessageId: string,
+): ChatMessage | undefined {
+  return stored.find((message) => message.clientMessageId === clientMessageId);
 }
 
 export function chatThreadReducer(state: ChatThreadState, action: ChatThreadAction): ChatThreadState {
@@ -309,6 +306,7 @@ export function chatThreadReducer(state: ChatThreadState, action: ChatThreadActi
         messages: [...thread.messages, action.message],
         messagesState: "ready",
         sendState: "idle",
+        pendingClientMessageId: undefined,
         updatedAt: action.now,
       }));
     case "sessionSynced":
@@ -320,15 +318,27 @@ export function chatThreadReducer(state: ChatThreadState, action: ChatThreadActi
       }));
     case "sendStarted":
       return updateThread(state, action.threadId, (thread) =>
-        thread.sendState === "sending" ? thread : { ...thread, sendState: "sending", sendError: undefined },
+        thread.sendState === "sending" && thread.pendingClientMessageId === action.clientMessageId
+          ? thread
+          : { ...thread, sendState: "sending", sendError: undefined, pendingClientMessageId: action.clientMessageId },
       );
     case "sendFailed":
-      return updateThread(state, action.threadId, (thread) => ({ ...thread, sendState: "error", sendError: action.message }));
+      return updateThread(state, action.threadId, (thread) => ({
+        ...thread,
+        sendState: "error",
+        sendError: action.message,
+        // A definitive failure proved the append was never stored, so the
+        // next send starts fresh. An ambiguous failure keeps its key so a
+        // retry of the same append stays idempotent on FastAPI.
+        pendingClientMessageId: action.definitive ? undefined : thread.pendingClientMessageId,
+      }));
     case "sendResolved":
       return updateThread(state, action.threadId, (thread) =>
-        thread.sendState === "idle" && thread.sendError === undefined
+        thread.sendState === "idle" &&
+        thread.sendError === undefined &&
+        thread.pendingClientMessageId === undefined
           ? thread
-          : { ...thread, sendState: "idle", sendError: undefined, updatedAt: action.now },
+          : { ...thread, sendState: "idle", sendError: undefined, pendingClientMessageId: undefined, updatedAt: action.now },
       );
     case "draftClearedIfUnchanged":
       return updateThread(state, action.threadId, (thread) =>

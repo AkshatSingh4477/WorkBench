@@ -37,6 +37,7 @@ const messagePayload = {
   role: "user",
   content: "Find the corrosion findings.",
   createdAt: "2026-09-06T01:21:00Z",
+  clientMessageId: "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
 };
 
 test("chat session and message responses parse into strict camelCase contracts", async () => {
@@ -58,7 +59,7 @@ test("chat session and message responses parse into strict camelCase contracts",
     requestLocalService: async (request) => {
       assert.equal(request.operation, "chatListMessages");
       assert.ok("sessionId" in request);
-      return ok({ messages: [messagePayload, { ...messagePayload, role: "assistant", authorUserId: null }] });
+      return ok({ messages: [messagePayload, { ...messagePayload, role: "assistant", authorUserId: null, clientMessageId: null }] });
     },
   });
 
@@ -92,6 +93,7 @@ test("malformed chat payloads are rejected instead of trusted", async () => {
     { messages: [{ ...messagePayload, content: "" }] },
     { messages: [{ ...messagePayload, authorUserId: 42 }] },
     { messages: [{ ...messagePayload, createdAt: "2026-09-06T01:21:00" }] },
+    { messages: [{ ...messagePayload, clientMessageId: "not-a-uuid" }] },
     { messages: [{ ...messagePayload, reasoning: "secret chain of thought" }] },
     { messages: null },
   ];
@@ -138,7 +140,10 @@ test("create and append round-trip the request bodies to the local service", asy
   });
 
   const created = await localApi.createChatSession({ workflowType: "inspectionAnalysis", title: "Inspection review" });
-  const appended = await localApi.appendChatMessage(sessionPayload.sessionId, { content: "Find the corrosion findings." });
+  const appended = await localApi.appendChatMessage(sessionPayload.sessionId, {
+    content: "Find the corrosion findings.",
+    clientMessageId: "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
+  });
   assert.equal(created.sessionId, sessionPayload.sessionId);
   assert.equal(appended.messageId, messagePayload.messageId);
   assert.deepEqual(requests[0], {
@@ -148,6 +153,6 @@ test("create and append round-trip the request bodies to the local service", asy
   assert.deepEqual(requests[1], {
     operation: "chatAppendMessage",
     sessionId: sessionPayload.sessionId,
-    request: { content: "Find the corrosion findings." },
+    request: { content: "Find the corrosion findings.", clientMessageId: "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d" },
   });
 });

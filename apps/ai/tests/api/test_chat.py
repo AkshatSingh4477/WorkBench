@@ -194,10 +194,14 @@ async def test_create_list_and_append_chat_messages(tmp_path: Path) -> None:
                     "POST",
                     f"/chat/sessions/{session_id}/messages",
                     cookie=cookie,
-                    body={"content": "  Find the corrosion findings.  "},
+                    body={
+                        "content": "  Find the corrosion findings.  ",
+                        "clientMessageId": str(uuid4()),
+                    },
                 ),
             )
         )
+        retry_key = str(uuid4())
         second_append = json.loads(
             await _dispatch(
                 app,
@@ -206,7 +210,31 @@ async def test_create_list_and_append_chat_messages(tmp_path: Path) -> None:
                     "POST",
                     f"/chat/sessions/{session_id}/messages",
                     cookie=cookie,
-                    body={"content": "Second message"},
+                    body={"content": "Second message", "clientMessageId": retry_key},
+                ),
+            )
+        )
+        committed_retry = json.loads(
+            await _dispatch(
+                app,
+                _frame(
+                    "append-retry",
+                    "POST",
+                    f"/chat/sessions/{session_id}/messages",
+                    cookie=cookie,
+                    body={"content": "Second message", "clientMessageId": retry_key},
+                ),
+            )
+        )
+        conflicting_retry = json.loads(
+            await _dispatch(
+                app,
+                _frame(
+                    "append-conflict",
+                    "POST",
+                    f"/chat/sessions/{session_id}/messages",
+                    cookie=cookie,
+                    body={"content": "Edited retry text", "clientMessageId": retry_key},
                 ),
             )
         )
@@ -227,6 +255,13 @@ async def test_create_list_and_append_chat_messages(tmp_path: Path) -> None:
     assert created["status"] == "active"
     assert first_append["status"] == 200
     assert second_append["status"] == 200
+    # A retry of a committed append returns the stored message unchanged, so
+    # an ambiguous renderer failure can never duplicate the employee message.
+    assert committed_retry["status"] == 200
+    assert _payload(committed_retry)["messageId"] == _payload(second_append)["messageId"]
+    assert _payload(committed_retry)["clientMessageId"] == retry_key
+    assert conflicting_retry["status"] == 200
+    assert _payload(conflicting_retry)["content"] == "Second message"
     messages = _payload(listed)["messages"]
     assert listed["status"] == 200
     assert isinstance(messages, list) and len(messages) == 2
@@ -273,7 +308,7 @@ async def test_message_validation_rejects_blank_and_overlong_content(tmp_path: P
                     "POST",
                     f"/chat/sessions/{session_id}/messages",
                     cookie=cookie,
-                    body={"content": "   "},
+                    body={"content": "   ", "clientMessageId": str(uuid4())},
                 ),
             )
         )
@@ -285,7 +320,7 @@ async def test_message_validation_rejects_blank_and_overlong_content(tmp_path: P
                     "POST",
                     f"/chat/sessions/{session_id}/messages",
                     cookie=cookie,
-                    body={"content": "x" * 20_001},
+                    body={"content": "x" * 20_001, "clientMessageId": str(uuid4())},
                 ),
             )
         )
@@ -345,7 +380,7 @@ async def test_chat_data_is_scoped_to_the_owning_employee(tmp_path: Path) -> Non
                     "POST",
                     f"/chat/sessions/{session_id}/messages",
                     cookie=second_cookie,
-                    body={"content": "Not my session"},
+                    body={"content": "Not my session", "clientMessageId": str(uuid4())},
                 ),
             )
         )
