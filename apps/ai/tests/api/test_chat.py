@@ -1,5 +1,6 @@
 """Employee chat route coverage through the private IPC dispatch path."""
 
+import asyncio
 import base64
 import json
 from pathlib import Path
@@ -194,10 +195,14 @@ async def test_create_list_and_append_chat_messages(tmp_path: Path) -> None:
                     "POST",
                     f"/chat/sessions/{session_id}/messages",
                     cookie=cookie,
-                    body={"content": "  Find the corrosion findings.  "},
+                    body={
+                        "content": "  Find the corrosion findings.  ",
+                        "clientMessageId": str(uuid4()),
+                    },
                 ),
             )
         )
+        retry_key = str(uuid4())
         second_append = json.loads(
             await _dispatch(
                 app,
@@ -206,7 +211,31 @@ async def test_create_list_and_append_chat_messages(tmp_path: Path) -> None:
                     "POST",
                     f"/chat/sessions/{session_id}/messages",
                     cookie=cookie,
-                    body={"content": "Second message"},
+                    body={"content": "Second message", "clientMessageId": retry_key},
+                ),
+            )
+        )
+        committed_retry = json.loads(
+            await _dispatch(
+                app,
+                _frame(
+                    "append-retry",
+                    "POST",
+                    f"/chat/sessions/{session_id}/messages",
+                    cookie=cookie,
+                    body={"content": "Second message", "clientMessageId": retry_key},
+                ),
+            )
+        )
+        conflicting_retry = json.loads(
+            await _dispatch(
+                app,
+                _frame(
+                    "append-conflict",
+                    "POST",
+                    f"/chat/sessions/{session_id}/messages",
+                    cookie=cookie,
+                    body={"content": "Edited retry text", "clientMessageId": retry_key},
                 ),
             )
         )
@@ -227,6 +256,13 @@ async def test_create_list_and_append_chat_messages(tmp_path: Path) -> None:
     assert created["status"] == "active"
     assert first_append["status"] == 200
     assert second_append["status"] == 200
+    # A retry of a committed append returns the stored message unchanged, so
+    # an ambiguous renderer failure can never duplicate the employee message.
+    assert committed_retry["status"] == 200
+    assert _payload(committed_retry)["messageId"] == _payload(second_append)["messageId"]
+    assert _payload(committed_retry)["clientMessageId"] == retry_key
+    assert conflicting_retry["status"] == 200
+    assert _payload(conflicting_retry)["content"] == "Second message"
     messages = _payload(listed)["messages"]
     assert listed["status"] == 200
     assert isinstance(messages, list) and len(messages) == 2
@@ -261,6 +297,45 @@ async def test_session_detail_rejects_unknown_sessions(tmp_path: Path) -> None:
     assert _payload(detail)["sessionId"] == session_id
 
 
+async def test_concurrent_retries_of_one_append_replay_the_stored_message(tmp_path: Path) -> None:
+    app, cookie, _ = await _build_app_with_two_employees(tmp_path)
+    async with app.router.lifespan_context(app):
+        session_id = await _create_session(app, cookie)
+        retry_key = str(uuid4())
+        raced = await asyncio.gather(
+            *(
+                _dispatch(
+                    app,
+                    _frame(
+                        f"append-race-{index}",
+                        "POST",
+                        f"/chat/sessions/{session_id}/messages",
+                        cookie=cookie,
+                        body={"content": "Raced append", "clientMessageId": retry_key},
+                    ),
+                )
+                for index in range(2)
+            )
+        )
+        listed = json.loads(
+            await _dispatch(
+                app,
+                _frame(
+                    "messages", "GET", f"/chat/sessions/{session_id}/messages", cookie=cookie
+                ),
+            )
+        )
+
+    responses = [json.loads(response) for response in raced]
+    assert [response["status"] for response in responses] == [200, 200]
+    # The losing insert replays the winning row instead of surfacing an
+    # integrity error, so a concurrent retry never returns a 500.
+    assert _payload(responses[0])["messageId"] == _payload(responses[1])["messageId"]
+    messages = _payload(listed)["messages"]
+    assert isinstance(messages, list) and len(messages) == 1
+    assert messages[0]["clientMessageId"] == retry_key
+
+
 async def test_message_validation_rejects_blank_and_overlong_content(tmp_path: Path) -> None:
     app, cookie, _ = await _build_app_with_two_employees(tmp_path)
     async with app.router.lifespan_context(app):
@@ -273,7 +348,7 @@ async def test_message_validation_rejects_blank_and_overlong_content(tmp_path: P
                     "POST",
                     f"/chat/sessions/{session_id}/messages",
                     cookie=cookie,
-                    body={"content": "   "},
+                    body={"content": "   ", "clientMessageId": str(uuid4())},
                 ),
             )
         )
@@ -285,7 +360,7 @@ async def test_message_validation_rejects_blank_and_overlong_content(tmp_path: P
                     "POST",
                     f"/chat/sessions/{session_id}/messages",
                     cookie=cookie,
-                    body={"content": "x" * 20_001},
+                    body={"content": "x" * 20_001, "clientMessageId": str(uuid4())},
                 ),
             )
         )
@@ -345,7 +420,7 @@ async def test_chat_data_is_scoped_to_the_owning_employee(tmp_path: Path) -> Non
                     "POST",
                     f"/chat/sessions/{session_id}/messages",
                     cookie=second_cookie,
-                    body={"content": "Not my session"},
+                    body={"content": "Not my session", "clientMessageId": str(uuid4())},
                 ),
             )
         )

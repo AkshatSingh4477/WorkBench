@@ -1,5 +1,7 @@
 """Employee chat request and response-envelope contracts for the local API."""
 
+from uuid import UUID
+
 from pydantic import Field
 
 from app.api.contracts import ApiContractModel
@@ -21,9 +23,14 @@ class ChatSessionListEnvelope(ApiContractModel):
 
 
 class ChatMessageAppendRequest(ApiContractModel):
-    """One employee-authored chat message; the service strips outer whitespace."""
+    """One employee-authored chat message; the service strips outer whitespace.
+
+    ``client_message_id`` is the renderer's idempotency key: a retry of the
+    same append returns the already stored message instead of duplicating it.
+    """
 
     content: str = Field(min_length=1, max_length=20_000)
+    client_message_id: UUID
 
 
 class ChatMessageListEnvelope(ApiContractModel):

@@ -63,6 +63,8 @@ class WorkflowMessage(ApiContractModel):
     role: str = Field(pattern="^(user|assistant)$")
     content: str = Field(min_length=1, max_length=20_000)
     created_at: UtcTimestamp
+    # Client-supplied idempotency key; null only for messages stored before the key existed.
+    client_message_id: UUID | None = None
 
 
 class StoredUpload(ApiContractModel):
@@ -241,7 +243,11 @@ class ChatStore(Protocol):
         ...
 
     async def append_message(self, message: WorkflowMessage) -> WorkflowMessage:
-        """Append a sanitized user or assistant message."""
+        """Append a sanitized user or assistant message.
+
+        A non-null client message id makes the append idempotent: a retry or
+        concurrent duplicate returns the already stored message.
+        """
         ...
 
     async def list_sessions(self, owner_user_id: UUID) -> list[WorkflowSession]:

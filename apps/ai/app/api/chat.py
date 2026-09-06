@@ -220,6 +220,7 @@ def build_chat_router() -> APIRouter:
                 role="user",
                 content=content,
                 created_at=datetime.now(UTC),
+                client_message_id=payload.client_message_id,
             )
         )
 

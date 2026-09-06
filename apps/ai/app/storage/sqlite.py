@@ -195,7 +195,8 @@ CREATE TABLE IF NOT EXISTS workflow_messages (
     author_user_id TEXT,
     role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
     content TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    client_message_id TEXT
 )
 """
 
@@ -244,6 +245,11 @@ CREATE TABLE IF NOT EXISTS artifacts (
 _CREATE_ARTIFACTS_RUN_INDEX = """
 CREATE INDEX IF NOT EXISTS artifacts_run_created
 ON artifacts (session_id, workflow_run_id, owner_user_id, created_at, artifact_id)
+"""
+
+_CREATE_WORKFLOW_MESSAGES_CLIENT_INDEX = """
+CREATE UNIQUE INDEX IF NOT EXISTS workflow_messages_session_client
+ON workflow_messages (session_id, client_message_id)
 """
 
 
@@ -312,7 +318,16 @@ class LocalSQLiteDatabase:
             await connection.execute(_CREATE_WORKFLOW_SESSIONS_TABLE)
             await connection.execute(_CREATE_WORKFLOW_SESSIONS_OWNER_INDEX)
             await connection.execute(_CREATE_WORKFLOW_MESSAGES_TABLE)
+            # Older local databases predate the client idempotency key; add the
+            # column in place so an existing development install keeps its data.
+            cursor = await connection.execute("PRAGMA table_info(workflow_messages)")
+            message_columns = {row[1] for row in await cursor.fetchall()}
+            if message_columns and "client_message_id" not in message_columns:
+                await connection.execute(
+                    "ALTER TABLE workflow_messages ADD COLUMN client_message_id TEXT"
+                )
             await connection.execute(_CREATE_WORKFLOW_MESSAGES_SESSION_INDEX)
+            await connection.execute(_CREATE_WORKFLOW_MESSAGES_CLIENT_INDEX)
             await connection.execute(_CREATE_APPROVALS_TABLE)
             await connection.execute(_CREATE_ARTIFACTS_TABLE)
             await connection.execute(_CREATE_ARTIFACTS_RUN_INDEX)
@@ -1098,14 +1113,23 @@ class SQLiteWorkflowStore:
         return session
 
     async def append_message(self, message: WorkflowMessage) -> WorkflowMessage:
-        """Append one sanitized message and refresh its session's updated_at."""
+        """Append one sanitized message and refresh its session's updated_at.
+
+        A client message id makes the append idempotent: a retry of the same
+        request returns the already stored message and writes nothing. Two
+        concurrent appends with one key resolve through the unique index: the
+        losing insert replays the winning row instead of surfacing an
+        integrity error.
+        """
 
         async with self._database.open() as connection:
-            await connection.execute(
+            cursor = await connection.execute(
                 """
                 INSERT INTO workflow_messages
-                (message_id, session_id, author_user_id, role, content, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                (message_id, session_id, author_user_id, role, content,
+                 created_at, client_message_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (session_id, client_message_id) DO NOTHING
                 """,
                 (
                     str(message.message_id),
@@ -1116,8 +1140,16 @@ class SQLiteWorkflowStore:
                     message.role,
                     message.content,
                     message.created_at.isoformat(),
+                    str(message.client_message_id)
+                    if message.client_message_id is not None
+                    else None,
                 ),
             )
+            if cursor.rowcount == 0:
+                stored = await self._stored_idempotent_message(connection, message)
+                if stored is None:
+                    raise RuntimeError("Idempotent message append could not be resolved")
+                return stored
             await connection.execute(
                 """
                 UPDATE workflow_sessions SET updated_at = ?
@@ -1126,6 +1158,23 @@ class SQLiteWorkflowStore:
                 (message.created_at.isoformat(), str(message.session_id)),
             )
         return message
+
+    async def _stored_idempotent_message(
+        self, connection: aiosqlite.Connection, message: WorkflowMessage
+    ) -> WorkflowMessage | None:
+        """Return the message another request already stored under this key."""
+
+        cursor = await connection.execute(
+            """
+            SELECT message_id, session_id, author_user_id, role, content,
+                   created_at, client_message_id
+            FROM workflow_messages
+            WHERE session_id = ? AND client_message_id = ?
+            """,
+            (str(message.session_id), str(message.client_message_id)),
+        )
+        row = await cursor.fetchone()
+        return self._message_from_row(row) if row is not None else None
 
     async def list_sessions(self, owner_user_id: UUID) -> list[WorkflowSession]:
         """Return the owner's sessions, most recently updated first."""
@@ -1177,7 +1226,7 @@ class SQLiteWorkflowStore:
                 """
                 SELECT messages.message_id, messages.session_id,
                        messages.author_user_id, messages.role, messages.content,
-                       messages.created_at
+                       messages.created_at, messages.client_message_id
                 FROM workflow_messages AS messages
                 JOIN workflow_sessions AS sessions
                   ON sessions.session_id = messages.session_id
@@ -1214,4 +1263,9 @@ class SQLiteWorkflowStore:
             role=row["role"],
             content=row["content"],
             created_at=row["created_at"],
+            client_message_id=(
+                UUID(row["client_message_id"])
+                if row["client_message_id"] is not None
+                else None
+            ),
         )
