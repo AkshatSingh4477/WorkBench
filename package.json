@@ -12,7 +12,14 @@
     "typecheck": "turbo run typecheck",
     "check": "turbo run lint typecheck --continue",
     "test": "turbo run test --continue",
-    "verify": "pnpm check && pnpm test && pnpm build"
+    "verify": "pnpm check && pnpm test && pnpm build",
+    "app": "pnpm --filter @workbench/desktop dev",
+    "app:dev-login": "node scripts/dev_workflow.mjs dev-login",
+    "app:stop": "node scripts/dev_workflow.mjs stop",
+    "account:list": "node scripts/dev_workflow.mjs account:list",
+    "account:provision": "node scripts/dev_workflow.mjs account:provision",
+    "account:secrets": "node scripts/dev_workflow.mjs account:secrets",
+    "db:reset": "node scripts/dev_workflow.mjs db:reset"
   },
   "devDependencies": {
     "turbo": "^2.5.8"
