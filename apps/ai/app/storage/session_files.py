@@ -14,8 +14,11 @@ from app.storage.session_workspace import LocalSessionWorkspaceStore
 from app.storage.sqlite import LocalSQLiteDatabase
 from app.workflow.contracts import WorkflowSession, WorkflowStage
 
+
 class UploadSessionStateConflictError(RuntimeError):
     """The workflow session changed before an upload could be committed."""
+
+
 class SQLiteSessionFileStore:
     """Write validated uploads atomically and retain only safe metadata in SQLite."""
 
