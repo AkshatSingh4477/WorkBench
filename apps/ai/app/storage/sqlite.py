@@ -468,6 +468,7 @@ class LocalSQLiteDatabase:
             await connection.execute(_CREATE_WORKFLOW_MESSAGES_SESSION_INDEX)
             await connection.execute(_CREATE_WORKFLOW_MESSAGES_CLIENT_INDEX)
             await connection.execute(_CREATE_WORKFLOW_UPLOADS_TABLE)
+            await self._migrate_legacy_workflow_uploads(connection)
             await connection.execute(_CREATE_WORKFLOW_UPLOADS_SESSION_INDEX)
             await connection.execute(_CREATE_APPROVALS_TABLE)
             await connection.execute(_CREATE_ARTIFACTS_TABLE)
@@ -552,6 +553,39 @@ class LocalSQLiteDatabase:
                 ),
             )
         await connection.execute("DROP TABLE activity_events_phase3_legacy")
+
+    @staticmethod
+    async def _migrate_legacy_workflow_uploads(
+        connection: aiosqlite.Connection,
+    ) -> None:
+        """Rebuild pre-validation upload metadata without dropping local records."""
+
+        cursor = await connection.execute(
+            """SELECT sql FROM sqlite_master
+            WHERE type = 'table' AND name = 'workflow_uploads'"""
+        )
+        row = await cursor.fetchone()
+        schema = row["sql"] if row is not None else ""
+        if (
+            "stored_file_name TEXT NOT NULL CHECK" in schema
+            and "mime_type TEXT NOT NULL CHECK" in schema
+        ):
+            return
+
+        await connection.execute(
+            "ALTER TABLE workflow_uploads RENAME TO workflow_uploads_legacy"
+        )
+        await connection.execute("DROP INDEX IF EXISTS workflow_uploads_session_created")
+        await connection.execute(_CREATE_WORKFLOW_UPLOADS_TABLE)
+        await connection.execute(
+            """INSERT INTO workflow_uploads
+            (upload_id, session_id, source_id, stored_file_name, file_name,
+             mime_type, size_bytes, sha256, created_at)
+            SELECT upload_id, session_id, source_id, stored_file_name, file_name,
+                   mime_type, size_bytes, sha256, created_at
+            FROM workflow_uploads_legacy"""
+        )
+        await connection.execute("DROP TABLE workflow_uploads_legacy")
 
     def _prepare_secure_paths(self) -> None:
         """Create and restrict the database directory and file before opening SQLite."""

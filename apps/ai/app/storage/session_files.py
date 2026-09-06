@@ -16,7 +16,7 @@ from app.storage.session_workspace import (
     LocalSessionWorkspaceStore,
     WorkspaceArea,
     WorkspacePathError,
-    _validate_file_name,
+    validate_file_name,
 )
 from app.storage.sqlite import LocalSQLiteDatabase
 from app.workflow.contracts import WorkflowSession, WorkflowStage
@@ -85,7 +85,7 @@ class SQLiteSessionFileStore:
     ) -> StoredUpload:
         """Persist one bounded stream without trusting caller-controlled paths."""
 
-        _validate_file_name(file_name)
+        validate_file_name(file_name)
         if not 1 <= len(mime_type) <= 255:
             raise ValueError("mime_type must contain between 1 and 255 characters")
         await self._require_session(session)

@@ -135,6 +135,111 @@ async def test_initialize_creates_metadata_only_upload_schema(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_initialize_migrates_legacy_upload_metadata_constraints(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "state" / "workbench.db"
+    database_path.parent.mkdir()
+    session = _session()
+    upload_id = uuid4()
+    source_id = uuid4()
+
+    async with aiosqlite.connect(database_path) as connection:
+        await connection.execute(
+            """CREATE TABLE workflow_sessions (
+            session_id TEXT PRIMARY KEY NOT NULL,
+            owner_user_id TEXT NOT NULL,
+            workflow_type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            stage TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            client_session_id TEXT)"""
+        )
+        await connection.execute(
+            """CREATE TABLE workflow_uploads (
+            upload_id TEXT PRIMARY KEY NOT NULL,
+            session_id TEXT NOT NULL REFERENCES workflow_sessions(session_id)
+                ON DELETE CASCADE,
+            source_id TEXT NOT NULL UNIQUE,
+            stored_file_name TEXT NOT NULL,
+            file_name TEXT NOT NULL,
+            mime_type TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL CHECK (size_bytes > 0),
+            sha256 TEXT NOT NULL CHECK (
+                length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            created_at TEXT NOT NULL,
+            UNIQUE (session_id, stored_file_name))"""
+        )
+        await connection.execute(
+            """INSERT INTO workflow_sessions
+            (session_id, owner_user_id, workflow_type, title, stage, status,
+             created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                str(session.session_id),
+                str(session.owner_user_id),
+                session.workflow_type.value,
+                session.title,
+                session.stage.value,
+                session.status.value,
+                session.created_at.isoformat(),
+                session.updated_at.isoformat(),
+            ),
+        )
+        await connection.execute(
+            """INSERT INTO workflow_uploads
+            (upload_id, session_id, source_id, stored_file_name, file_name,
+             mime_type, size_bytes, sha256, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                str(upload_id),
+                str(session.session_id),
+                str(source_id),
+                f"{upload_id}.upload",
+                "report.txt",
+                "text/plain",
+                4,
+                hashlib.sha256(b"data").hexdigest(),
+                _CREATED_AT.isoformat(),
+            ),
+        )
+        await connection.commit()
+
+    database = LocalSQLiteDatabase(database_path)
+    await database.initialize()
+
+    async with database.open() as connection:
+        row = await (
+            await connection.execute(
+                "SELECT file_name FROM workflow_uploads WHERE upload_id = ?",
+                (str(upload_id),),
+            )
+        ).fetchone()
+        assert row["file_name"] == "report.txt"
+        with pytest.raises(aiosqlite.IntegrityError):
+            await connection.execute(
+                """INSERT INTO workflow_uploads
+                (upload_id, session_id, source_id, stored_file_name, file_name,
+                 mime_type, size_bytes, sha256, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    str(uuid4()),
+                    str(session.session_id),
+                    str(uuid4()),
+                    "unsafe.upload",
+                    "../unsafe.txt",
+                    "text/plain",
+                    1,
+                    hashlib.sha256(b"x").hexdigest(),
+                    _CREATED_AT.isoformat(),
+                ),
+            )
+
+
+@pytest.mark.asyncio
 async def test_streamed_upload_round_trips_and_resolves_after_restart(tmp_path: Path) -> None:
     database, workspaces, workflows, store = await _stores(tmp_path)
     session = _session()

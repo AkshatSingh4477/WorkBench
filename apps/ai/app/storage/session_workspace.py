@@ -19,7 +19,7 @@ _WINDOWS_RESERVED_NAMES = {
 }
 
 
-def _validate_file_name(file_name: str) -> str:
+def validate_file_name(file_name: str) -> str:
     """Return one safe local filename using the workspace-wide policy."""
 
     windows_stem = file_name.split(".", maxsplit=1)[0].upper()
@@ -128,7 +128,7 @@ class LocalSessionWorkspaceStore:
 
         workspace = self.get_session_workspace(session_id)
         workspace_area = self._validate_area(area)
-        safe_file_name = _validate_file_name(file_name)
+        safe_file_name = validate_file_name(file_name)
         area_path = workspace.path_for(workspace_area)
         destination = self.file_path(session_id, workspace_area, safe_file_name)
 
@@ -160,7 +160,7 @@ class LocalSessionWorkspaceStore:
 
         workspace = self.get_session_workspace(session_id)
         workspace_area = self._validate_area(area)
-        safe_file_name = _validate_file_name(file_name)
+        safe_file_name = validate_file_name(file_name)
         unresolved = workspace.path_for(workspace_area) / safe_file_name
         self._reject_symlink(unresolved)
         return self._contained_path(unresolved)
