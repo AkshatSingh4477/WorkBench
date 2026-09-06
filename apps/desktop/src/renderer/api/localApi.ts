@@ -49,6 +49,16 @@ export class LocalApiError extends Error {
   }
 }
 
+/**
+ * True only when FastAPI answered the request itself: a status means its
+ * transaction definitively committed or rolled back, so an idempotency key
+ * may be released. Timeouts and lost connections prove nothing because the
+ * request may still be in flight, and must keep the key.
+ */
+export function apiFailureWasDefinitive(error: unknown): boolean {
+  return error instanceof LocalApiError && error.status !== undefined;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }

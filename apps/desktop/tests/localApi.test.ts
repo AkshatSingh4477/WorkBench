@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ChatMessage, ChatSession, LocalServiceRequest, LocalServiceResponse } from "../src/shared/contracts.ts";
-import { LocalApiError, localApi } from "../src/renderer/api/localApi.ts";
+import { LocalApiError, apiFailureWasDefinitive, localApi } from "../src/renderer/api/localApi.ts";
 
 interface StubBridge {
   requestLocalService(request: LocalServiceRequest): Promise<LocalServiceResponse>;
@@ -125,6 +125,21 @@ test("chat resource 404s are distinguished from missing endpoints", async () => 
     localApi.listChatMessages(sessionPayload.sessionId),
     (error: unknown) => error instanceof LocalApiError && error.kind === "endpointUnavailable",
   );
+});
+
+test("only answered service failures may release an idempotency key", () => {
+  // FastAPI answered: its transaction committed or rolled back definitively.
+  assert.equal(apiFailureWasDefinitive(new LocalApiError("rejected", "unauthorized", 401)), true);
+  assert.equal(apiFailureWasDefinitive(new LocalApiError("closed session", "http", 409)), true);
+  assert.equal(apiFailureWasDefinitive(new LocalApiError("service error", "http", 500)), true);
+  assert.equal(apiFailureWasDefinitive(new LocalApiError("missing session", "resourceNotFound", 404)), true);
+  assert.equal(apiFailureWasDefinitive(new LocalApiError("missing route", "endpointUnavailable", 404)), true);
+  // The request may still be in flight; absence from a read proves nothing.
+  assert.equal(apiFailureWasDefinitive(new LocalApiError("timed out", "timeout")), false);
+  assert.equal(apiFailureWasDefinitive(new LocalApiError("pipe closed", "network")), false);
+  assert.equal(apiFailureWasDefinitive(new LocalApiError("unreadable body", "malformedJson")), false);
+  assert.equal(apiFailureWasDefinitive(new LocalApiError("unexpected body", "invalidResponse")), false);
+  assert.equal(apiFailureWasDefinitive(new Error("unrelated failure")), false);
 });
 
 test("create and append round-trip the request bodies to the local service", async () => {
