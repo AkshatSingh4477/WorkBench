@@ -156,6 +156,7 @@ export function useChatThreads({ apiBaseUrl, connected, examplesEnabled }: ChatT
 
       const requestSequence = (sendSequencesRef.current.get(threadId) ?? 0) + 1;
       sendSequencesRef.current.set(threadId, requestSequence);
+      const submittedDraft = thread.draft;
       const preSendMessages = thread.messages;
       // The snapshot is trustworthy after a loaded message list, or for a
       // session this send just created where the stored list starts empty.
@@ -176,7 +177,7 @@ export function useChatThreads({ apiBaseUrl, connected, examplesEnabled }: ChatT
           const message = await localApi.appendChatMessage(sessionId, { content }, apiBaseUrl);
           if (sendSequencesRef.current.get(threadId) !== requestSequence) return;
           dispatch({ type: "messageAppended", threadId, message, now: Date.now() });
-          dispatch({ type: "draftCleared", threadId, now: Date.now() });
+          dispatch({ type: "draftClearedIfUnchanged", threadId, draft: submittedDraft, now: Date.now() });
           try {
             const refreshed = await localApi.getChatSession(sessionId, apiBaseUrl);
             if (sendSequencesRef.current.get(threadId) !== requestSequence) return;
@@ -195,7 +196,7 @@ export function useChatThreads({ apiBaseUrl, connected, examplesEnabled }: ChatT
               if (sendSequencesRef.current.get(threadId) !== requestSequence) return;
               if (appendedMessageWasDelivered(preSendMessages, stored.messages, content)) {
                 dispatch({ type: "messagesLoaded", threadId, messages: stored.messages });
-                dispatch({ type: "draftCleared", threadId, now: Date.now() });
+                dispatch({ type: "draftClearedIfUnchanged", threadId, draft: submittedDraft, now: Date.now() });
                 dispatch({ type: "sendResolved", threadId, now: Date.now() });
                 return;
               }

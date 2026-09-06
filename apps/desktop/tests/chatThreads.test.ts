@@ -241,14 +241,20 @@ test("session binding adopts the backend title only for a new chat", () => {
   assert.equal(boundRenamed.threads.find((candidate) => candidate.id === renamed.id)?.title, "Pump 4 seal review");
 });
 
-test("draft clearing keeps unrelated drafts", () => {
+test("draft clearing submits the exact snapshot and keeps newer edits", () => {
   const first = { ...thread("first", 30), draft: "Send me" };
   const second = { ...thread("second", 20), draft: "Keep me" };
   const state = stateOf([first, second], first.id);
-  const result = chatThreadReducer(state, { type: "draftCleared", threadId: first.id, now: 40 });
-  assert.equal(result.threads[0]?.draft, "");
-  assert.equal(result.threads[1]?.draft, "Keep me");
-  assert.equal(chatThreadReducer(result, { type: "draftCleared", threadId: first.id, now: 50 }), result);
+  const cleared = chatThreadReducer(state, { type: "draftClearedIfUnchanged", threadId: first.id, draft: "Send me", now: 40 });
+  assert.equal(cleared.threads[0]?.draft, "");
+  assert.equal(cleared.threads[1]?.draft, "Keep me");
+
+  const edited = { ...cleared, threads: [{ ...cleared.threads[0]!, draft: "Send me and more" }, cleared.threads[1]!] };
+  const kept = chatThreadReducer(edited, { type: "draftClearedIfUnchanged", threadId: first.id, draft: "Send me", now: 50 });
+  assert.equal(kept.threads[0]?.draft, "Send me and more");
+  assert.equal(chatThreadReducer(kept, { type: "draftClearedIfUnchanged", threadId: first.id, draft: "Send me", now: 60 }), kept);
+  const finished = chatThreadReducer(kept, { type: "draftClearedIfUnchanged", threadId: first.id, draft: "Send me and more", now: 70 });
+  assert.equal(finished.threads[0]?.draft, "");
 });
 
 test("session titles derive from the first draft line without splitting mid-word content", () => {
@@ -320,6 +326,28 @@ test("session refresh adopts the backend title only for an unrenamed new chat", 
   assert.equal(result.threads[0]?.title, "Backend title");
 });
 
+test("session refresh keeps bound threads with live send or unsent state", () => {
+  const sending = {
+    ...thread("sending", 30),
+    title: "Pump 4 seal review",
+    sessionId: "66666666-6666-4666-8666-666666666666",
+    sendState: "sending" as const,
+    messages: [message("Earlier message")],
+  };
+  const drafted = { ...thread("drafted", 25), sessionId: "77777777-7777-4777-8777-777777777777", draft: "Retry text" };
+  const stale = { ...thread("stale", 20), sessionId: "88888888-8888-4888-8888-888888888888" };
+  const state = stateOf([sending, drafted, stale], sending.id, "loading");
+  const result = chatThreadReducer(state, {
+    type: "sessionsLoaded", freshThreadId: "fresh" as ChatThreadId, now: 40,
+    sessions: [session("44444444-4444-4444-8444-444444444444")],
+  });
+  assert.equal(result.threads.length, 3);
+  assert.ok(result.threads.some((candidate) => candidate.id === sending.id));
+  assert.ok(result.threads.some((candidate) => candidate.id === drafted.id));
+  assert.ok(!result.threads.some((candidate) => candidate.id === stale.id));
+  assert.equal(result.activeThreadId, sending.id);
+});
+
 test("session refresh drops bound threads the backend no longer returns", () => {
   const stale = { ...thread("stale", 30), sessionId: "55555555-5555-4555-8555-555555555555" };
   const state = stateOf([stale], stale.id, "loading");
@@ -332,12 +360,13 @@ test("session refresh drops bound threads the backend no longer returns", () => 
   assert.equal(result.activeThreadId, "chat-44444444-4444-4444-8444-444444444444");
 });
 
-test("ambiguous appends count as delivered only for unseen employee content", () => {
+test("ambiguous appends count as delivered only for an unseen matching tail", () => {
   const stored = [message("Pump 4 seal shows scoring"), message("Second note")];
-  assert.equal(appendedMessageWasDelivered([], stored, "Pump 4 seal shows scoring"), true);
-  assert.equal(appendedMessageWasDelivered([stored[0]!], stored, "Pump 4 seal shows scoring"), false);
+  assert.equal(appendedMessageWasDelivered([], stored, "Pump 4 seal shows scoring"), false);
+  assert.equal(appendedMessageWasDelivered([], stored, "Second note"), true);
+  assert.equal(appendedMessageWasDelivered([stored[1]!], stored, "Second note"), false);
   assert.equal(
-    appendedMessageWasDelivered([], [{ ...stored[0]!, role: "assistant" }], "Pump 4 seal shows scoring"),
+    appendedMessageWasDelivered([], [{ ...stored[1]!, role: "assistant" }], "Second note"),
     false,
   );
   assert.equal(appendedMessageWasDelivered([], stored, "Never stored"), false);

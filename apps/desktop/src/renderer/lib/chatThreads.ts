@@ -68,7 +68,7 @@ export type ChatThreadAction =
   | { type: "sendStarted"; threadId: ChatThreadId }
   | { type: "sendFailed"; threadId: ChatThreadId; message: string }
   | { type: "sendResolved"; threadId: ChatThreadId; now: number }
-  | { type: "draftCleared"; threadId: ChatThreadId; now: number };
+  | { type: "draftClearedIfUnchanged"; threadId: ChatThreadId; draft: string; now: number };
 
 let localThreadSequence = 0;
 
@@ -185,18 +185,21 @@ export function mergeBackendThread(existing: ChatThread, backend: LocalChatThrea
   };
 }
 
-/**
- * An ambiguous append failure counts as delivered only when the stored list
- * contains an exact employee message that the pre-send snapshot did not have.
- */
+/** An append counts as delivered only when the stored list ends with an unseen
+ * employee message whose content matches this request. Matching any position
+ * would misattribute an older identical message to a failed append. */
 export function appendedMessageWasDelivered(
   snapshot: readonly ChatMessage[],
   stored: readonly ChatMessage[],
   content: string,
 ): boolean {
+  const last = stored[stored.length - 1];
   const snapshotIds = new Set(snapshot.map((message) => message.messageId));
-  return stored.some(
-    (message) => message.role === "user" && message.content === content && !snapshotIds.has(message.messageId),
+  return (
+    last !== undefined &&
+    last.role === "user" &&
+    last.content === content &&
+    !snapshotIds.has(last.messageId)
   );
 }
 
@@ -252,7 +255,10 @@ export function chatThreadReducer(state: ChatThreadState, action: ChatThreadActi
           keptThreads.push(mergeBackendThread(existing, backend));
           continue;
         }
-        if (existing.sessionId === undefined && threadHasUnsentContent(existing)) {
+        // Keep threads with unsent content or an in-flight send: a session
+        // list captured before a concurrent first bind must not erase live
+        // renderer state or strand its pending append callback.
+        if (threadHasUnsentContent(existing) || existing.sendState === "sending") {
           keptThreads.push(existing);
         }
         // Stale bound threads and pristine empty threads drop out of the list.
@@ -312,9 +318,11 @@ export function chatThreadReducer(state: ChatThreadState, action: ChatThreadActi
           ? thread
           : { ...thread, sendState: "idle", sendError: undefined, updatedAt: action.now },
       );
-    case "draftCleared":
+    case "draftClearedIfUnchanged":
       return updateThread(state, action.threadId, (thread) =>
-        thread.draft.length === 0 ? thread : { ...thread, draft: "", updatedAt: action.now },
+        thread.draft.length > 0 && thread.draft === action.draft
+          ? { ...thread, draft: "", updatedAt: action.now }
+          : thread,
       );
   }
 }
