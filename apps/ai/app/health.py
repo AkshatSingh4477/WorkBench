@@ -16,6 +16,7 @@ from app.ports.backend2 import (
     SubsystemReadiness,
     SystemHealthProvider,
     SystemHealthReport,
+    WorkflowStore,
 )
 
 ShutdownCallback = Callable[[], Awaitable[None]]
@@ -32,6 +33,7 @@ class ApplicationDependencies:
     auth_session_store: AuthSessionStore | None = None
     audit_store: AuditStore | None = None
     chat_store: ChatStore | None = None
+    workflow_store: WorkflowStore | None = None
     shutdown: ShutdownCallback | None = None
     startup: StartupCallback | None = None
 
