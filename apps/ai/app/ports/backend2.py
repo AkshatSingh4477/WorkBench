@@ -286,9 +286,9 @@ class ApprovalStore(Protocol):
         ...
 
     async def record_execution_result(
-        self, *, approval_id: UUID, result: ToolExecutionResult
+        self, *, approval_id: UUID, execution_claim_token: UUID, result: ToolExecutionResult
     ) -> Approval | None:
-        """Durably attach an executor result to the approval claimed by this process."""
+        """Attach a result only when the caller supplies the winning claim token."""
         ...
 
     async def get_execution_result(
