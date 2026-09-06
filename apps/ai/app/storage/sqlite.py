@@ -178,13 +178,19 @@ CREATE TABLE IF NOT EXISTS workflow_sessions (
         status IN ('active', 'completed', 'failed', 'approvalRejected')
     ),
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    client_session_id TEXT
 )
 """
 
 _CREATE_WORKFLOW_SESSIONS_OWNER_INDEX = """
 CREATE INDEX IF NOT EXISTS workflow_sessions_owner_updated
 ON workflow_sessions (owner_user_id, updated_at DESC)
+"""
+
+_CREATE_WORKFLOW_SESSIONS_CLIENT_INDEX = """
+CREATE UNIQUE INDEX IF NOT EXISTS workflow_sessions_client
+ON workflow_sessions (client_session_id)
 """
 
 _CREATE_WORKFLOW_MESSAGES_TABLE = """
@@ -317,6 +323,15 @@ class LocalSQLiteDatabase:
             await connection.execute(_CREATE_SESSIONS_TABLE)
             await connection.execute(_CREATE_WORKFLOW_SESSIONS_TABLE)
             await connection.execute(_CREATE_WORKFLOW_SESSIONS_OWNER_INDEX)
+            # Older local databases predate the client session key; add the
+            # column in place so an existing development install keeps its data.
+            cursor = await connection.execute("PRAGMA table_info(workflow_sessions)")
+            session_columns = {row[1] for row in await cursor.fetchall()}
+            if session_columns and "client_session_id" not in session_columns:
+                await connection.execute(
+                    "ALTER TABLE workflow_sessions ADD COLUMN client_session_id TEXT"
+                )
+            await connection.execute(_CREATE_WORKFLOW_SESSIONS_CLIENT_INDEX)
             await connection.execute(_CREATE_WORKFLOW_MESSAGES_TABLE)
             # Older local databases predate the client idempotency key; add the
             # column in place so an existing development install keeps its data.
@@ -1084,16 +1099,24 @@ class SQLiteWorkflowStore:
         self._database = database
 
     async def create_session(self, session: WorkflowSession) -> WorkflowSession:
-        """Insert one owned workflow session and reject duplicate identifiers."""
+        """Insert one owned workflow session.
+
+        A client session id makes creation idempotent: a retry of the same
+        request returns the already stored session and writes nothing. Two
+        concurrent creates with one key resolve through the unique index, the
+        losing insert replaying the winning row. Without the key the first
+        insert wins and duplicates are rejected.
+        """
 
         try:
             async with self._database.open() as connection:
-                await connection.execute(
+                cursor = await connection.execute(
                     """
                     INSERT INTO workflow_sessions
                     (session_id, owner_user_id, workflow_type, title, stage,
-                     status, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     status, created_at, updated_at, client_session_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (client_session_id) DO NOTHING
                     """,
                     (
                         str(session.session_id),
@@ -1104,13 +1127,49 @@ class SQLiteWorkflowStore:
                         session.status.value,
                         session.created_at.isoformat(),
                         session.updated_at.isoformat(),
+                        str(session.client_session_id)
+                        if session.client_session_id is not None
+                        else None,
                     ),
                 )
+                if cursor.rowcount == 0:
+                    # Only a non-null client key can conflict with the index.
+                    key = session.client_session_id
+                    if key is None:
+                        raise RuntimeError("Idempotent session create could not be resolved")
+                    stored = await self._stored_client_session(
+                        connection, key, session.owner_user_id
+                    )
+                    if stored is None:
+                        raise SessionAlreadyExistsError(
+                            f"Workflow session already exists: {session.session_id}"
+                        )
+                    return stored
         except aiosqlite.IntegrityError as error:
             raise SessionAlreadyExistsError(
                 f"Workflow session already exists: {session.session_id}"
             ) from error
         return session
+
+    async def _stored_client_session(
+        self,
+        connection: aiosqlite.Connection,
+        client_session_id: UUID,
+        owner_user_id: UUID,
+    ) -> WorkflowSession | None:
+        """Return the session another request stored under this key for this owner."""
+
+        cursor = await connection.execute(
+            """
+            SELECT session_id, owner_user_id, workflow_type, title, stage,
+                   status, created_at, updated_at, client_session_id
+            FROM workflow_sessions
+            WHERE client_session_id = ? AND owner_user_id = ?
+            """,
+            (str(client_session_id), str(owner_user_id)),
+        )
+        row = await cursor.fetchone()
+        return self._workflow_session_from_row(row) if row is not None else None
 
     async def append_message(self, message: WorkflowMessage) -> WorkflowMessage:
         """Append one sanitized message and refresh its session's updated_at.
@@ -1183,7 +1242,7 @@ class SQLiteWorkflowStore:
             cursor = await connection.execute(
                 """
                 SELECT session_id, owner_user_id, workflow_type, title, stage,
-                       status, created_at, updated_at
+                       status, created_at, updated_at, client_session_id
                 FROM workflow_sessions
                 WHERE owner_user_id = ?
                 ORDER BY updated_at DESC, session_id DESC
@@ -1203,7 +1262,7 @@ class SQLiteWorkflowStore:
             cursor = await connection.execute(
                 """
                 SELECT session_id, owner_user_id, workflow_type, title, stage,
-                       status, created_at, updated_at
+                       status, created_at, updated_at, client_session_id
                 FROM workflow_sessions
                 WHERE session_id = ? AND owner_user_id = ?
                 """,
@@ -1250,6 +1309,11 @@ class SQLiteWorkflowStore:
             status=WorkflowStatus(row["status"]),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            client_session_id=(
+                UUID(row["client_session_id"])
+                if row["client_session_id"] is not None
+                else None
+            ),
         )
 
     @staticmethod

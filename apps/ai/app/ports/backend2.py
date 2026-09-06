@@ -239,7 +239,11 @@ class ChatStore(Protocol):
     """
 
     async def create_session(self, session: WorkflowSession) -> WorkflowSession:
-        """Atomically persist a newly created workflow session."""
+        """Atomically persist a newly created workflow session.
+
+        A non-null client session id makes creation idempotent: a retry or
+        concurrent duplicate returns the already stored session.
+        """
         ...
 
     async def append_message(self, message: WorkflowMessage) -> WorkflowMessage:

@@ -28,6 +28,7 @@ const sessionPayload = {
   status: "active",
   createdAt: "2026-09-06T01:20:00Z",
   updatedAt: "2026-09-06T01:21:00Z",
+  clientSessionId: null,
 };
 
 const messagePayload = {
@@ -157,7 +158,11 @@ test("create and append round-trip the request bodies to the local service", asy
     },
   });
 
-  const created = await localApi.createChatSession({ workflowType: "inspectionAnalysis", title: "Inspection review" });
+  const created = await localApi.createChatSession({
+    workflowType: "inspectionAnalysis",
+    title: "Inspection review",
+    clientSessionId: "4ef46b0e-7c1a-4d9e-9f2a-3f5c6b7d8e92",
+  });
   const appended = await localApi.appendChatMessage(sessionPayload.sessionId, {
     content: "Find the corrosion findings.",
     clientMessageId: "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
@@ -166,7 +171,11 @@ test("create and append round-trip the request bodies to the local service", asy
   assert.equal(appended.messageId, messagePayload.messageId);
   assert.deepEqual(requests[0], {
     operation: "chatCreateSession",
-    request: { workflowType: "inspectionAnalysis", title: "Inspection review" },
+    request: {
+      workflowType: "inspectionAnalysis",
+      title: "Inspection review",
+      clientSessionId: "4ef46b0e-7c1a-4d9e-9f2a-3f5c6b7d8e92",
+    },
   });
   assert.deepEqual(requests[1], {
     operation: "chatAppendMessage",

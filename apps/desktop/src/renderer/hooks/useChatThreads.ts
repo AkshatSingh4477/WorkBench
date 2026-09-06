@@ -168,13 +168,24 @@ export function useChatThreads({ apiBaseUrl, connected, examplesEnabled }: ChatT
       const requestSequence = (sendSequencesRef.current.get(threadId) ?? 0) + 1;
       sendSequencesRef.current.set(threadId, requestSequence);
       const clientMessageId = thread.pendingClientMessageId ?? globalThis.crypto.randomUUID();
-      dispatch({ type: "sendStarted", threadId, clientMessageId, draft: submittedDraft });
+      // One idempotency key per unresolved session create: a lost create
+      // response keeps it, so the retry replays the committed session on
+      // FastAPI instead of storing an empty duplicate conversation.
+      const clientSessionId =
+        thread.sessionId === undefined
+          ? (thread.pendingClientSessionId ?? globalThis.crypto.randomUUID())
+          : undefined;
+      dispatch({ type: "sendStarted", threadId, clientMessageId, clientSessionId, draft: submittedDraft });
       void (async () => {
         let sessionId = thread.sessionId;
         try {
           if (sessionId === undefined) {
             const created = await localApi.createChatSession(
-              { workflowType: thread.workflowType, title: chatSessionTitleFromDraft(content) },
+              {
+                workflowType: thread.workflowType,
+                title: chatSessionTitleFromDraft(content),
+                clientSessionId,
+              },
               apiBaseUrl,
             );
             if (sendSequencesRef.current.get(threadId) !== requestSequence) return;
@@ -198,27 +209,29 @@ export function useChatThreads({ apiBaseUrl, connected, examplesEnabled }: ChatT
           }
         } catch (error) {
           if (sendSequencesRef.current.get(threadId) !== requestSequence) return;
-          // Release the idempotency key only when the outcome is certain:
-          // FastAPI answered the append itself (its transaction either
-          // committed or rolled back), or the append was never attempted.
-          // A stored list that lacks the key is not certain: a timed-out
-          // append may still commit after the read, so the key and draft
-          // stay in place and a retry reuses the same key on FastAPI.
-          if (sessionId === undefined || apiFailureWasDefinitive(error)) {
+          // Release the keys only when the outcome is certain: FastAPI
+          // answered and refused before any write, so nothing was stored.
+          // A lost create response no longer releases anything: the pending
+          // session key replays the committed session, and a lost append
+          // response keeps its key for the same reason as before. Ambiguous
+          // failures keep the keys and draft until a retry resolves them.
+          if (apiFailureWasDefinitive(error)) {
             dispatch({ type: "sendFailed", threadId, message: sendFailureMessage(error), definitive: true });
             return;
           }
-          try {
-            const stored = await localApi.listChatMessages(sessionId, apiBaseUrl);
-            if (sendSequencesRef.current.get(threadId) !== requestSequence) return;
-            if (findDeliveredMessage(stored.messages, clientMessageId) !== undefined) {
-              dispatch({ type: "messagesLoaded", threadId, messages: stored.messages });
-              dispatch({ type: "draftClearedIfUnchanged", threadId, draft: submittedDraft, now: Date.now() });
-              dispatch({ type: "sendResolved", threadId, now: Date.now() });
-              return;
+          if (sessionId !== undefined) {
+            try {
+              const stored = await localApi.listChatMessages(sessionId, apiBaseUrl);
+              if (sendSequencesRef.current.get(threadId) !== requestSequence) return;
+              if (findDeliveredMessage(stored.messages, clientMessageId) !== undefined) {
+                dispatch({ type: "messagesLoaded", threadId, messages: stored.messages });
+                dispatch({ type: "draftClearedIfUnchanged", threadId, draft: submittedDraft, now: Date.now() });
+                dispatch({ type: "sendResolved", threadId, now: Date.now() });
+                return;
+              }
+            } catch {
+              // Reconciliation failed too; the append error stays visible.
             }
-          } catch {
-            // Reconciliation failed too; the append error stays visible.
           }
           dispatch({ type: "sendFailed", threadId, message: sendFailureMessage(error), definitive: false });
         } finally {

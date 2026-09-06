@@ -231,6 +231,8 @@ export const chatSessionSchema = z.strictObject({
   status: chatSessionStatusSchema,
   createdAt: chatTimestampSchema,
   updatedAt: chatTimestampSchema,
+  /** Null for sessions stored before the renderer idempotency key existed. */
+  clientSessionId: uuidSchema.nullable(),
 });
 
 /** One persisted chat message without model reasoning fields. */
@@ -260,6 +262,8 @@ export const chatSessionCreateRequestSchema = z.strictObject({
     .min(1)
     .max(200)
     .refine((title) => title.trim().length > 0, { message: "title must not be blank" }),
+  /** Renderer idempotency key: a retried create returns the stored session. */
+  clientSessionId: uuidSchema.optional(),
 });
 
 export const chatMessageAppendRequestSchema = z.strictObject({
