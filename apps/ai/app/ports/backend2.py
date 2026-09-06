@@ -243,7 +243,11 @@ class ChatStore(Protocol):
         ...
 
     async def append_message(self, message: WorkflowMessage) -> WorkflowMessage:
-        """Append a sanitized user or assistant message."""
+        """Append a sanitized user or assistant message.
+
+        A non-null client message id makes the append idempotent: a retry or
+        concurrent duplicate returns the already stored message.
+        """
         ...
 
     async def list_sessions(self, owner_user_id: UUID) -> list[WorkflowSession]:

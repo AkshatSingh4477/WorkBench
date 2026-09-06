@@ -1,5 +1,6 @@
 """Employee chat route coverage through the private IPC dispatch path."""
 
+import asyncio
 import base64
 import json
 from pathlib import Path
@@ -294,6 +295,45 @@ async def test_session_detail_rejects_unknown_sessions(tmp_path: Path) -> None:
     assert _payload(missing)["code"] == "session_not_found"
     assert detail["status"] == 200
     assert _payload(detail)["sessionId"] == session_id
+
+
+async def test_concurrent_retries_of_one_append_replay_the_stored_message(tmp_path: Path) -> None:
+    app, cookie, _ = await _build_app_with_two_employees(tmp_path)
+    async with app.router.lifespan_context(app):
+        session_id = await _create_session(app, cookie)
+        retry_key = str(uuid4())
+        raced = await asyncio.gather(
+            *(
+                _dispatch(
+                    app,
+                    _frame(
+                        f"append-race-{index}",
+                        "POST",
+                        f"/chat/sessions/{session_id}/messages",
+                        cookie=cookie,
+                        body={"content": "Raced append", "clientMessageId": retry_key},
+                    ),
+                )
+                for index in range(2)
+            )
+        )
+        listed = json.loads(
+            await _dispatch(
+                app,
+                _frame(
+                    "messages", "GET", f"/chat/sessions/{session_id}/messages", cookie=cookie
+                ),
+            )
+        )
+
+    responses = [json.loads(response) for response in raced]
+    assert [response["status"] for response in responses] == [200, 200]
+    # The losing insert replays the winning row instead of surfacing an
+    # integrity error, so a concurrent retry never returns a 500.
+    assert _payload(responses[0])["messageId"] == _payload(responses[1])["messageId"]
+    messages = _payload(listed)["messages"]
+    assert isinstance(messages, list) and len(messages) == 1
+    assert messages[0]["clientMessageId"] == retry_key
 
 
 async def test_message_validation_rejects_blank_and_overlong_content(tmp_path: Path) -> None:

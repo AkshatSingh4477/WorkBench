@@ -1116,29 +1116,20 @@ class SQLiteWorkflowStore:
         """Append one sanitized message and refresh its session's updated_at.
 
         A client message id makes the append idempotent: a retry of the same
-        request returns the already stored message and writes nothing.
+        request returns the already stored message and writes nothing. Two
+        concurrent appends with one key resolve through the unique index: the
+        losing insert replays the winning row instead of surfacing an
+        integrity error.
         """
 
         async with self._database.open() as connection:
-            if message.client_message_id is not None:
-                cursor = await connection.execute(
-                    """
-                    SELECT message_id, session_id, author_user_id, role, content,
-                           created_at, client_message_id
-                    FROM workflow_messages
-                    WHERE session_id = ? AND client_message_id = ?
-                    """,
-                    (str(message.session_id), str(message.client_message_id)),
-                )
-                existing = await cursor.fetchone()
-                if existing is not None:
-                    return self._message_from_row(existing)
-            await connection.execute(
+            cursor = await connection.execute(
                 """
                 INSERT INTO workflow_messages
                 (message_id, session_id, author_user_id, role, content,
                  created_at, client_message_id)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (session_id, client_message_id) DO NOTHING
                 """,
                 (
                     str(message.message_id),
@@ -1154,6 +1145,11 @@ class SQLiteWorkflowStore:
                     else None,
                 ),
             )
+            if cursor.rowcount == 0:
+                stored = await self._stored_idempotent_message(connection, message)
+                if stored is None:
+                    raise RuntimeError("Idempotent message append could not be resolved")
+                return stored
             await connection.execute(
                 """
                 UPDATE workflow_sessions SET updated_at = ?
@@ -1162,6 +1158,23 @@ class SQLiteWorkflowStore:
                 (message.created_at.isoformat(), str(message.session_id)),
             )
         return message
+
+    async def _stored_idempotent_message(
+        self, connection: aiosqlite.Connection, message: WorkflowMessage
+    ) -> WorkflowMessage | None:
+        """Return the message another request already stored under this key."""
+
+        cursor = await connection.execute(
+            """
+            SELECT message_id, session_id, author_user_id, role, content,
+                   created_at, client_message_id
+            FROM workflow_messages
+            WHERE session_id = ? AND client_message_id = ?
+            """,
+            (str(message.session_id), str(message.client_message_id)),
+        )
+        row = await cursor.fetchone()
+        return self._message_from_row(row) if row is not None else None
 
     async def list_sessions(self, owner_user_id: UUID) -> list[WorkflowSession]:
         """Return the owner's sessions, most recently updated first."""

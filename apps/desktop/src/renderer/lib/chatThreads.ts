@@ -34,6 +34,8 @@ interface ChatThreadFields {
   sendError?: string;
   /** Client idempotency key of an unresolved append; retries reuse it. */
   pendingClientMessageId?: string;
+  /** Draft snapshot bound to the pending key; retries resend it, not later edits. */
+  pendingDraft?: string;
   /** True once a completed session list has included this session. */
   seenInSessions?: boolean;
 }
@@ -69,7 +71,7 @@ export type ChatThreadAction =
   | { type: "sessionBound"; threadId: ChatThreadId; session: ChatSession }
   | { type: "messageAppended"; threadId: ChatThreadId; message: ChatMessage; now: number }
   | { type: "sessionSynced"; threadId: ChatThreadId; session: ChatSession }
-  | { type: "sendStarted"; threadId: ChatThreadId; clientMessageId: string }
+  | { type: "sendStarted"; threadId: ChatThreadId; clientMessageId: string; draft: string }
   | { type: "sendFailed"; threadId: ChatThreadId; message: string; definitive: boolean }
   | { type: "sendResolved"; threadId: ChatThreadId; now: number }
   | { type: "draftClearedIfUnchanged"; threadId: ChatThreadId; draft: string; now: number };
@@ -112,6 +114,7 @@ export function chatThreadFromSession(session: ChatSession): LocalChatThread {
 export function threadHasUnsentContent(thread: ChatThread): boolean {
   return (
     thread.draft.trim().length > 0 ||
+    (thread.pendingDraft?.trim().length ?? 0) > 0 ||
     thread.attachments.length > 0 ||
     thread.inspectionFiles.inspectionReport !== undefined ||
     thread.inspectionFiles.sitePhotograph !== undefined
@@ -188,6 +191,7 @@ export function mergeBackendThread(existing: ChatThread, backend: LocalChatThrea
     sendState: existing.sendState,
     sendError: existing.sendError,
     pendingClientMessageId: existing.pendingClientMessageId,
+    pendingDraft: existing.pendingDraft,
   };
 }
 
@@ -307,6 +311,7 @@ export function chatThreadReducer(state: ChatThreadState, action: ChatThreadActi
         messagesState: "ready",
         sendState: "idle",
         pendingClientMessageId: undefined,
+        pendingDraft: undefined,
         updatedAt: action.now,
       }));
     case "sessionSynced":
@@ -320,7 +325,15 @@ export function chatThreadReducer(state: ChatThreadState, action: ChatThreadActi
       return updateThread(state, action.threadId, (thread) =>
         thread.sendState === "sending" && thread.pendingClientMessageId === action.clientMessageId
           ? thread
-          : { ...thread, sendState: "sending", sendError: undefined, pendingClientMessageId: action.clientMessageId },
+          : {
+              ...thread,
+              sendState: "sending",
+              sendError: undefined,
+              pendingClientMessageId: action.clientMessageId,
+              // A retry keeps the snapshot its key was created for; the
+              // current draft may have been edited after the failure.
+              pendingDraft: thread.pendingDraft ?? action.draft,
+            },
       );
     case "sendFailed":
       return updateThread(state, action.threadId, (thread) => ({
@@ -328,17 +341,27 @@ export function chatThreadReducer(state: ChatThreadState, action: ChatThreadActi
         sendState: "error",
         sendError: action.message,
         // A definitive failure proved the append was never stored, so the
-        // next send starts fresh. An ambiguous failure keeps its key so a
-        // retry of the same append stays idempotent on FastAPI.
+        // next send starts fresh. An ambiguous failure keeps its key and
+        // bound draft so a retry of the same append stays idempotent on
+        // FastAPI and later edits stay out of the retried payload.
         pendingClientMessageId: action.definitive ? undefined : thread.pendingClientMessageId,
+        pendingDraft: action.definitive ? undefined : thread.pendingDraft,
       }));
     case "sendResolved":
       return updateThread(state, action.threadId, (thread) =>
         thread.sendState === "idle" &&
         thread.sendError === undefined &&
-        thread.pendingClientMessageId === undefined
+        thread.pendingClientMessageId === undefined &&
+        thread.pendingDraft === undefined
           ? thread
-          : { ...thread, sendState: "idle", sendError: undefined, pendingClientMessageId: undefined, updatedAt: action.now },
+          : {
+              ...thread,
+              sendState: "idle",
+              sendError: undefined,
+              pendingClientMessageId: undefined,
+              pendingDraft: undefined,
+              updatedAt: action.now,
+            },
       );
     case "draftClearedIfUnchanged":
       return updateThread(state, action.threadId, (thread) =>

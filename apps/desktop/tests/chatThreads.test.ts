@@ -177,7 +177,7 @@ test("session sync and failure paths update only the targeted thread", () => {
   const other = thread("other", 20);
   const state = stateOf([bound, other], bound.id);
 
-  const started = chatThreadReducer(state, { type: "sendStarted", threadId: bound.id, clientMessageId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd" });
+  const started = chatThreadReducer(state, { type: "sendStarted", threadId: bound.id, clientMessageId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd", draft: "" });
   assert.equal(started.threads[0]?.sendState, "sending");
 
   const synced = chatThreadReducer(started, {
@@ -193,7 +193,7 @@ test("session sync and failure paths update only the targeted thread", () => {
   assert.equal(failed.threads[0]?.sendError, "FastAPI is unavailable. The message was not sent.");
   assert.equal(failed.threads[1], other);
 
-  const cleared = chatThreadReducer(failed, { type: "sendStarted", threadId: bound.id, clientMessageId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd" });
+  const cleared = chatThreadReducer(failed, { type: "sendStarted", threadId: bound.id, clientMessageId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd", draft: "" });
   assert.equal(cleared.threads[0]?.sendState, "sending");
   assert.equal(cleared.threads[0]?.sendError, undefined);
   assert.equal(chatThreadReducer(cleared, { type: "sendFailed", threadId: "unknown" as ChatThreadId, message: "ignored", definitive: true }), cleared);
@@ -269,6 +269,7 @@ test("session titles derive from the first draft line without splitting mid-word
 test("unsent-content detection drives preservation", () => {
   assert.equal(threadHasUnsentContent(thread("empty", 10)), false);
   assert.equal(threadHasUnsentContent({ ...thread("draft", 10), draft: " note " }), true);
+  assert.equal(threadHasUnsentContent({ ...thread("pending", 10), pendingDraft: "Unresolved append" }), true);
   assert.equal(threadHasUnsentContent({ ...thread("attached", 10), attachments: [{ name: "a.pdf", mimeType: "application/pdf", sizeBytes: 1 }] }), true);
   assert.equal(threadHasUnsentContent({ ...thread("report", 10), inspectionFiles: { inspectionReport: { name: "r.pdf", kind: "inspectionReport", mimeType: "application/pdf", sizeBytes: 1 } } }), true);
 });
@@ -438,11 +439,13 @@ test("the pending append key survives failures and refreshes until resolution", 
   const state = stateOf([first], first.id);
   const key = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 
-  const started = chatThreadReducer(state, { type: "sendStarted", threadId: first.id, clientMessageId: key });
+  const started = chatThreadReducer(state, { type: "sendStarted", threadId: first.id, clientMessageId: key, draft: "Ambiguous send" });
   assert.equal(started.threads[0]?.pendingClientMessageId, key);
+  assert.equal(started.threads[0]?.pendingDraft, "Ambiguous send");
 
   const ambiguous = chatThreadReducer(started, { type: "sendFailed", threadId: first.id, message: "The local service timed out. The message was not sent.", definitive: false });
   assert.equal(ambiguous.threads[0]?.pendingClientMessageId, key);
+  assert.equal(ambiguous.threads[0]?.pendingDraft, "Ambiguous send");
   assert.equal(ambiguous.threads[0]?.sendState, "error");
 
   const refreshed = chatThreadReducer(ambiguous, {
@@ -458,7 +461,7 @@ test("the pending append key survives failures and refreshes until resolution", 
     draft: "Ambiguous send",
   };
   const boundState = stateOf([bound], bound.id);
-  const boundStarted = chatThreadReducer(boundState, { type: "sendStarted", threadId: bound.id, clientMessageId: key });
+  const boundStarted = chatThreadReducer(boundState, { type: "sendStarted", threadId: bound.id, clientMessageId: key, draft: "Ambiguous send" });
   const boundRefreshed = chatThreadReducer(boundStarted, {
     type: "sessionsLoaded", freshThreadId: "fresh" as ChatThreadId, now: 45,
     sessions: [session("55555555-5555-4555-8555-555555555555")],
@@ -467,10 +470,12 @@ test("the pending append key survives failures and refreshes until resolution", 
 
   const delivered = chatThreadReducer(boundRefreshed, { type: "sendResolved", threadId: bound.id, now: 50 });
   assert.equal(delivered.threads[0]?.pendingClientMessageId, undefined);
+  assert.equal(delivered.threads[0]?.pendingDraft, undefined);
   assert.equal(delivered.threads[0]?.sendState, "idle");
 
   const definitive = chatThreadReducer(boundStarted, { type: "sendFailed", threadId: bound.id, message: "The message was rejected.", definitive: true });
   assert.equal(definitive.threads[0]?.pendingClientMessageId, undefined);
+  assert.equal(definitive.threads[0]?.pendingDraft, undefined);
   assert.equal(definitive.threads[0]?.sendState, "error");
 
   const appended = chatThreadReducer(boundStarted, {
@@ -479,7 +484,39 @@ test("the pending append key survives failures and refreshes until resolution", 
     now: 55,
   });
   assert.equal(appended.threads[0]?.pendingClientMessageId, undefined);
+  assert.equal(appended.threads[0]?.pendingDraft, undefined);
   assert.equal(appended.threads[0]?.messages.length, 1);
+});
+
+test("a retry resends the pending draft snapshot and keeps later edits", () => {
+  const first = { ...thread("first", 30), draft: "Ambiguous send" };
+  const state = stateOf([first], first.id);
+  const key = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+
+  const started = chatThreadReducer(state, { type: "sendStarted", threadId: first.id, clientMessageId: key, draft: "Ambiguous send" });
+  const ambiguous = chatThreadReducer(started, { type: "sendFailed", threadId: first.id, message: "The local service timed out. The message was not sent.", definitive: false });
+  const edited = chatThreadReducer(ambiguous, { type: "updateDraft", threadId: first.id, draft: "Ambiguous send, edited", now: 35 });
+
+  // A retry re-enters sendStarted, but the snapshot stays bound to the key.
+  const retried = chatThreadReducer(edited, { type: "sendStarted", threadId: first.id, clientMessageId: key, draft: "Ambiguous send, edited" });
+  assert.equal(retried.threads[0]?.pendingClientMessageId, key);
+  assert.equal(retried.threads[0]?.pendingDraft, "Ambiguous send");
+  assert.equal(retried.threads[0]?.sendState, "sending");
+
+  // Resolving the retried append clears only the submitted snapshot.
+  const delivered = chatThreadReducer(retried, {
+    type: "messageAppended", threadId: first.id,
+    message: { ...message("Ambiguous send"), clientMessageId: key },
+    now: 40,
+  });
+  const cleared = chatThreadReducer(delivered, { type: "draftClearedIfUnchanged", threadId: first.id, draft: "Ambiguous send", now: 45 });
+  assert.equal(cleared.threads[0]?.draft, "Ambiguous send, edited");
+  assert.equal(cleared.threads[0]?.pendingDraft, undefined);
+  assert.equal(cleared.threads[0]?.pendingClientMessageId, undefined);
+
+  // The unresolved snapshot alone keeps the thread across a refresh.
+  const unresolved = { ...ambiguous.threads[0]!, draft: "" };
+  assert.equal(threadHasUnsentContent(unresolved), true);
 });
 
 test("send resolution clears an ambiguous failure exactly once", () => {

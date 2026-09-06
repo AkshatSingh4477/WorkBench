@@ -128,12 +128,15 @@ test("chat resource 404s are distinguished from missing endpoints", async () => 
 });
 
 test("only answered service failures may release an idempotency key", () => {
-  // FastAPI answered: its transaction committed or rolled back definitively.
+  // FastAPI answered and refused before any write: nothing was stored.
   assert.equal(apiFailureWasDefinitive(new LocalApiError("rejected", "unauthorized", 401)), true);
   assert.equal(apiFailureWasDefinitive(new LocalApiError("closed session", "http", 409)), true);
-  assert.equal(apiFailureWasDefinitive(new LocalApiError("service error", "http", 500)), true);
   assert.equal(apiFailureWasDefinitive(new LocalApiError("missing session", "resourceNotFound", 404)), true);
   assert.equal(apiFailureWasDefinitive(new LocalApiError("missing route", "endpointUnavailable", 404)), true);
+  // A 5xx proves nothing: the service can fail after the same append
+  // committed through a concurrent request, so the key must stay.
+  assert.equal(apiFailureWasDefinitive(new LocalApiError("service error", "http", 500)), false);
+  assert.equal(apiFailureWasDefinitive(new LocalApiError("overloaded", "http", 503)), false);
   // The request may still be in flight; absence from a read proves nothing.
   assert.equal(apiFailureWasDefinitive(new LocalApiError("timed out", "timeout")), false);
   assert.equal(apiFailureWasDefinitive(new LocalApiError("pipe closed", "network")), false);

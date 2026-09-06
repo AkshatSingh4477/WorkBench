@@ -150,17 +150,19 @@ export function useChatThreads({ apiBaseUrl, connected, examplesEnabled }: ChatT
     (threadId: ChatThreadId) => {
       const thread = stateRef.current.threads.find((candidate) => candidate.id === threadId);
       if (!thread || thread.source === "example" || thread.sendState === "sending") return;
-      const content = thread.draft.trim();
+      // One idempotency key per unresolved append, bound to the draft snapshot
+      // it was created for: retries reuse both, so FastAPI can never store the
+      // message twice and an edited composer draft is never mistaken for the
+      // pending payload.
+      const submittedDraft = thread.pendingDraft ?? thread.draft;
+      const content = submittedDraft.trim();
       if (content.length === 0) return;
       if (thread.status !== undefined && thread.status !== "active") return;
 
       const requestSequence = (sendSequencesRef.current.get(threadId) ?? 0) + 1;
       sendSequencesRef.current.set(threadId, requestSequence);
-      const submittedDraft = thread.draft;
-      // One idempotency key per unresolved append: retries of the same send
-      // reuse it, so FastAPI can never store the message twice.
       const clientMessageId = thread.pendingClientMessageId ?? globalThis.crypto.randomUUID();
-      dispatch({ type: "sendStarted", threadId, clientMessageId });
+      dispatch({ type: "sendStarted", threadId, clientMessageId, draft: submittedDraft });
       void (async () => {
         let sessionId = thread.sessionId;
         try {
