@@ -218,6 +218,7 @@ async def test_initialize_migrates_legacy_upload_metadata_constraints(
                 (str(upload_id),),
             )
         ).fetchone()
+        assert row is not None
         assert row["file_name"] == "report.txt"
         with pytest.raises(aiosqlite.IntegrityError):
             await connection.execute(
