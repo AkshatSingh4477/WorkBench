@@ -1,6 +1,9 @@
 """Local persistence implementations owned by Backend 2."""
 
-from app.storage.session_files import SQLiteSessionFileStore
+from app.storage.session_files import (
+    SQLiteSessionFileStore,
+    UploadSessionStateConflictError,
+)
 from app.storage.session_workspace import (
     LocalSessionWorkspaceStore,
     SessionWorkspace,
@@ -47,6 +50,7 @@ __all__ = [
     "SessionAlreadyExistsError",
     "SessionMetadata",
     "SessionWorkspace",
+    "UploadSessionStateConflictError",
     "WorkflowRunAlreadyExistsError",
     "WorkflowRunContextMismatchError",
     "WorkflowSessionNotFoundError",

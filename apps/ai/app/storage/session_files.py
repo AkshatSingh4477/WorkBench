@@ -12,9 +12,10 @@ from app.ai.schemas import ApprovedPath
 from app.ports.backend2 import StoredUpload
 from app.storage.session_workspace import LocalSessionWorkspaceStore
 from app.storage.sqlite import LocalSQLiteDatabase
-from app.workflow.contracts import WorkflowSession
+from app.workflow.contracts import WorkflowSession, WorkflowStage
 
-
+class UploadSessionStateConflictError(RuntimeError):
+    """The workflow session changed before an upload could be committed."""
 class SQLiteSessionFileStore:
     """Write validated uploads atomically and retain only safe metadata in SQLite."""
 
@@ -80,10 +81,13 @@ class SQLiteSessionFileStore:
                 cursor = await connection.execute(
                     """INSERT INTO workflow_uploads
                     (upload_id, session_id, source_id, stored_file_name, file_name, mime_type,
-                     size_bytes, sha256, created_at)
+                    size_bytes, sha256, created_at)
                     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
                     FROM workflow_sessions
-                    WHERE session_id = ?""",
+                    WHERE session_id = ?
+                    AND owner_user_id = ?
+                    AND workflow_type = ?
+                    AND stage = ?""",
                     (
                         str(stored.upload_id),
                         str(stored.session_id),
@@ -95,10 +99,15 @@ class SQLiteSessionFileStore:
                         stored.sha256,
                         stored.created_at.isoformat(),
                         str(session.session_id),
+                        str(session.owner_user_id),
+                        session.workflow_type.value,
+                        WorkflowStage.COLLECTING_INPUTS.value,
                     ),
                 )
                 if cursor.rowcount != 1:
-                    raise RuntimeError("workflow session was not available for upload")
+                    raise UploadSessionStateConflictError(
+                        "workflow session no longer accepts this upload"
+                    )
             return stored
         except BaseException:
             if placed:

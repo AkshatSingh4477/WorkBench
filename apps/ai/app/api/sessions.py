@@ -31,7 +31,10 @@ from app.ports.backend2 import (
     SessionFileStore,
     WorkflowStore,
 )
-from app.storage import WorkflowSessionNotFoundError
+from app.storage import (
+    UploadSessionStateConflictError,
+    WorkflowSessionNotFoundError,
+)
 from app.workflow.contracts import (
     ActivityEvent,
     ActivityEventType,
@@ -343,6 +346,8 @@ def build_session_router() -> APIRouter:
             return _error(*_UNSUPPORTED_MEDIA, status.HTTP_415_UNSUPPORTED_MEDIA_TYPE)
         except (UnicodeDecodeError, UploadValidationError, ValueError):
             return _error(*_INVALID_FILE, status.HTTP_422_UNPROCESSABLE_CONTENT)
+        except UploadSessionStateConflictError:
+            return _error(*_INVALID_STAGE, status.HTTP_409_CONFLICT)
         except Exception:
             return _error(*_STORAGE_UNAVAILABLE, status.HTTP_503_SERVICE_UNAVAILABLE)
         finally:
