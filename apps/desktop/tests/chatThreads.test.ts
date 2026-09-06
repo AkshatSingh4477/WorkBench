@@ -36,6 +36,7 @@ function session(sessionId: string, overrides: Partial<ChatSession> = {}): ChatS
     status: "active",
     createdAt: "2026-09-01T10:00:00Z",
     updatedAt: "2026-09-01T10:05:00Z",
+    clientSessionId: null,
     ...overrides,
   };
 }
@@ -287,6 +288,7 @@ test("unsent-content detection drives preservation", () => {
   assert.equal(threadHasUnsentContent(thread("empty", 10)), false);
   assert.equal(threadHasUnsentContent({ ...thread("draft", 10), draft: " note " }), true);
   assert.equal(threadHasUnsentContent({ ...thread("pending", 10), pendingDraft: "Unresolved append" }), true);
+  assert.equal(threadHasUnsentContent({ ...thread("creating", 10), pendingClientSessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd" }), true);
   assert.equal(threadHasUnsentContent({ ...thread("attached", 10), attachments: [{ name: "a.pdf", mimeType: "application/pdf", sizeBytes: 1 }] }), true);
   assert.equal(threadHasUnsentContent({ ...thread("report", 10), inspectionFiles: { inspectionReport: { name: "r.pdf", kind: "inspectionReport", mimeType: "application/pdf", sizeBytes: 1 } } }), true);
 });
@@ -455,13 +457,16 @@ test("the pending append key survives failures and refreshes until resolution", 
   const first = { ...thread("first", 30), draft: "Ambiguous send" };
   const state = stateOf([first], first.id);
   const key = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+  const sessionKey = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
 
-  const started = chatThreadReducer(state, { type: "sendStarted", threadId: first.id, clientMessageId: key, draft: "Ambiguous send" });
+  const started = chatThreadReducer(state, { type: "sendStarted", threadId: first.id, clientMessageId: key, clientSessionId: sessionKey, draft: "Ambiguous send" });
   assert.equal(started.threads[0]?.pendingClientMessageId, key);
+  assert.equal(started.threads[0]?.pendingClientSessionId, sessionKey);
   assert.equal(started.threads[0]?.pendingDraft, "Ambiguous send");
 
   const ambiguous = chatThreadReducer(started, { type: "sendFailed", threadId: first.id, message: "The local service timed out. The message was not sent.", definitive: false });
   assert.equal(ambiguous.threads[0]?.pendingClientMessageId, key);
+  assert.equal(ambiguous.threads[0]?.pendingClientSessionId, sessionKey);
   assert.equal(ambiguous.threads[0]?.pendingDraft, "Ambiguous send");
   assert.equal(ambiguous.threads[0]?.sendState, "error");
 
@@ -492,6 +497,7 @@ test("the pending append key survives failures and refreshes until resolution", 
 
   const definitive = chatThreadReducer(boundStarted, { type: "sendFailed", threadId: bound.id, message: "The message was rejected.", definitive: true });
   assert.equal(definitive.threads[0]?.pendingClientMessageId, undefined);
+  assert.equal(definitive.threads[0]?.pendingClientSessionId, undefined);
   assert.equal(definitive.threads[0]?.pendingDraft, undefined);
   assert.equal(definitive.threads[0]?.sendState, "error");
 
@@ -501,8 +507,64 @@ test("the pending append key survives failures and refreshes until resolution", 
     now: 55,
   });
   assert.equal(appended.threads[0]?.pendingClientMessageId, undefined);
+  assert.equal(appended.threads[0]?.pendingClientSessionId, undefined);
   assert.equal(appended.threads[0]?.pendingDraft, undefined);
   assert.equal(appended.threads[0]?.messages.length, 1);
+});
+
+test("a replayed session create binds the draft thread instead of duplicating it", () => {
+  // The create committed on FastAPI but its response was lost: the thread
+  // stays unbound with its draft while the next refresh lists the session.
+  const orphaned = { ...thread("orphaned", 30), title: "New chat", draft: "First message", sendState: "error" as const };
+  const state = stateOf([orphaned], orphaned.id, "loading");
+  const started = chatThreadReducer(state, {
+    type: "sendStarted", threadId: orphaned.id,
+    clientMessageId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+    clientSessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+    draft: "First message",
+  });
+  const failed = chatThreadReducer(started, { type: "sendFailed", threadId: orphaned.id, message: "The local service timed out. The message was not sent.", definitive: false });
+
+  const refreshed = chatThreadReducer(failed, {
+    type: "sessionsLoaded", freshThreadId: "fresh" as ChatThreadId, now: 40,
+    sessions: [session("55555555-5555-4555-8555-555555555555", { clientSessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd", title: "First message" })],
+  });
+  // The draft thread rebinds to the committed session; no duplicate thread
+  // is created for the same session.
+  assert.equal(refreshed.threads.length, 1);
+  const bound = refreshed.threads[0]!;
+  assert.equal(bound.id, orphaned.id);
+  assert.equal(bound.sessionId, "55555555-5555-4555-8555-555555555555");
+  assert.equal(bound.title, "First message");
+  assert.equal(bound.draft, "First message");
+  assert.equal(bound.pendingClientSessionId, undefined);
+  assert.equal(bound.pendingClientMessageId, "cccccccc-cccc-4ccc-8ccc-cccccccccccc");
+  assert.equal(bound.seenInSessions, true);
+  assert.equal(refreshed.activeThreadId, orphaned.id);
+
+  // A retry create of the same key also clears the pending session key.
+  const rebound = chatThreadReducer(refreshed, {
+    type: "sessionBound", threadId: orphaned.id,
+    session: session("55555555-5555-4555-8555-555555555555"),
+  });
+  assert.equal(rebound.threads[0]?.pendingClientSessionId, undefined);
+});
+
+test("an unbound thread with a pending session key survives a refresh that omits it", () => {
+  const orphaned = {
+    ...thread("orphaned", 30),
+    draft: "",
+    sendState: "error" as const,
+    pendingClientSessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+  };
+  const state = stateOf([orphaned], orphaned.id, "loading");
+  const refreshed = chatThreadReducer(state, {
+    type: "sessionsLoaded", freshThreadId: "fresh" as ChatThreadId, now: 40,
+    sessions: [],
+  });
+  // The committed session is not listed yet, but the unresolved send means
+  // the thread may still bind to it on a later refresh.
+  assert.ok(refreshed.threads.some((candidate) => candidate.id === orphaned.id));
 });
 
 test("a retry resends the pending draft snapshot and keeps later edits", () => {

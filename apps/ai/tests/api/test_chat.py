@@ -136,6 +136,111 @@ async def _create_session(
     return session_id
 
 
+async def test_idempotent_session_creation_replays_the_stored_session(tmp_path: Path) -> None:
+    app, cookie, second_cookie = await _build_app_with_two_employees(tmp_path)
+    async with app.router.lifespan_context(app):
+        session_key = str(uuid4())
+        created = json.loads(
+            await _dispatch(
+                app,
+                _frame(
+                    "create-keyed",
+                    "POST",
+                    "/chat/sessions",
+                    cookie=cookie,
+                    body={
+                        "workflowType": "inspectionAnalysis",
+                        "title": "Inspection review",
+                        "clientSessionId": session_key,
+                    },
+                ),
+            )
+        )
+        # A lost create response replays the committed session, even when the
+        # retry drifted to a different title.
+        replayed = json.loads(
+            await _dispatch(
+                app,
+                _frame(
+                    "create-retry",
+                    "POST",
+                    "/chat/sessions",
+                    cookie=cookie,
+                    body={
+                        "workflowType": "inspectionAnalysis",
+                        "title": "Edited title",
+                        "clientSessionId": session_key,
+                    },
+                ),
+            )
+        )
+        raced = await asyncio.gather(
+            *(
+                _dispatch(
+                    app,
+                    _frame(
+                        f"create-race-{index}",
+                        "POST",
+                        "/chat/sessions",
+                        cookie=cookie,
+                        body={
+                            "workflowType": "inspectionAnalysis",
+                            "title": "Inspection review",
+                            "clientSessionId": session_key,
+                        },
+                    ),
+                )
+                for index in range(2)
+            )
+        )
+        # A foreign employee reusing the key must not reach the session.
+        foreign = json.loads(
+            await _dispatch(
+                app,
+                _frame(
+                    "create-foreign",
+                    "POST",
+                    "/chat/sessions",
+                    cookie=second_cookie,
+                    body={
+                        "workflowType": "inspectionAnalysis",
+                        "title": "Inspection review",
+                        "clientSessionId": session_key,
+                    },
+                ),
+            )
+        )
+        listed = json.loads(
+            await _dispatch(app, _frame("sessions", "GET", "/chat/sessions", cookie=cookie))
+        )
+        foreign_listed = json.loads(
+            await _dispatch(
+                app,
+                _frame("foreign-sessions", "GET", "/chat/sessions", cookie=second_cookie),
+            )
+        )
+
+    responses = [json.loads(response) for response in raced]
+    created_session = _payload(created)
+    assert created["status"] == 200
+    assert created_session["clientSessionId"] == session_key
+    # Every replay and concurrent create returns the first committed session.
+    assert replayed["status"] == 200
+    assert _payload(replayed)["sessionId"] == created_session["sessionId"]
+    assert _payload(replayed)["title"] == "Inspection review"
+    assert [response["status"] for response in responses] == [200, 200]
+    assert all(
+        _payload(response)["sessionId"] == created_session["sessionId"] for response in responses
+    )
+    # The foreign key reuse is rejected without exposing the owner's session.
+    assert foreign["status"] == 500
+    assert _payload(foreign)["code"] == "session_conflict"
+    sessions = _payload(listed)["sessions"]
+    assert isinstance(sessions, list) and len(sessions) == 1
+    foreign_sessions = _payload(foreign_listed)["sessions"]
+    assert isinstance(foreign_sessions, list) and len(foreign_sessions) == 0
+
+
 async def test_chat_requires_capability_and_an_authenticated_employee(tmp_path: Path) -> None:
     app, cookie, _ = await _build_app_with_two_employees(tmp_path)
     async with app.router.lifespan_context(app):

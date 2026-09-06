@@ -34,7 +34,9 @@ interface ChatThreadFields {
   sendError?: string;
   /** Client idempotency key of an unresolved append; retries reuse it. */
   pendingClientMessageId?: string;
-  /** Draft snapshot bound to the pending key; retries resend it, not later edits. */
+  /** Client idempotency key of an unresolved session create; retries reuse it. */
+  pendingClientSessionId?: string;
+  /** Draft snapshot bound to the pending keys; retries resend it, not later edits. */
   pendingDraft?: string;
   /** True once a completed session list has included this session. */
   seenInSessions?: boolean;
@@ -71,7 +73,7 @@ export type ChatThreadAction =
   | { type: "sessionBound"; threadId: ChatThreadId; session: ChatSession }
   | { type: "messageAppended"; threadId: ChatThreadId; message: ChatMessage; now: number }
   | { type: "sessionSynced"; threadId: ChatThreadId; session: ChatSession }
-  | { type: "sendStarted"; threadId: ChatThreadId; clientMessageId: string; draft: string }
+  | { type: "sendStarted"; threadId: ChatThreadId; clientMessageId: string; clientSessionId?: string; draft: string }
   | { type: "sendFailed"; threadId: ChatThreadId; message: string; definitive: boolean }
   | { type: "sendResolved"; threadId: ChatThreadId; now: number }
   | { type: "draftClearedIfUnchanged"; threadId: ChatThreadId; draft: string; now: number };
@@ -115,6 +117,8 @@ export function threadHasUnsentContent(thread: ChatThread): boolean {
   return (
     thread.draft.trim().length > 0 ||
     (thread.pendingDraft?.trim().length ?? 0) > 0 ||
+    // An unresolved session create may still bind to its committed session.
+    thread.pendingClientSessionId !== undefined ||
     thread.attachments.length > 0 ||
     thread.inspectionFiles.inspectionReport !== undefined ||
     thread.inspectionFiles.sitePhotograph !== undefined
@@ -191,6 +195,7 @@ export function mergeBackendThread(existing: ChatThread, backend: LocalChatThrea
     sendState: existing.sendState,
     sendError: existing.sendError,
     pendingClientMessageId: existing.pendingClientMessageId,
+    pendingClientSessionId: existing.pendingClientSessionId,
     pendingDraft: existing.pendingDraft,
   };
 }
@@ -266,6 +271,10 @@ export function chatThreadReducer(state: ChatThreadState, action: ChatThreadActi
       // merge by session ID so unsent content and history survive a refresh.
       const backendThreads = action.sessions.map(chatThreadFromSession);
       const backendBySessionId = new Map(backendThreads.map((thread) => [thread.sessionId, thread]));
+      // A create that committed while its response was lost shows up here by
+      // its client key; the refresh rebinds the draft thread to it instead of
+      // leaving a duplicate empty conversation beside the unsent draft.
+      const replayedSessionIds = new Map(action.sessions.map((session) => [session.clientSessionId, session.sessionId]));
       const keptThreads: ChatThread[] = [];
       for (const existing of state.threads) {
         if (existing.source === "example") {
@@ -290,6 +299,22 @@ export function chatThreadReducer(state: ChatThreadState, action: ChatThreadActi
           }
           keptThreads.push(existing);
           continue;
+        }
+        const replayedSessionId =
+          existing.pendingClientSessionId === undefined
+            ? undefined
+            : replayedSessionIds.get(existing.pendingClientSessionId);
+        if (replayedSessionId !== undefined) {
+          const replayed = backendBySessionId.get(replayedSessionId);
+          if (replayed !== undefined) {
+            backendBySessionId.delete(replayed.sessionId);
+            keptThreads.push({
+              ...mergeBackendThread(existing, replayed),
+              pendingClientSessionId: undefined,
+              seenInSessions: true,
+            });
+            continue;
+          }
         }
         // Unbound threads survive a refresh only while they hold unsent content.
         if (threadHasUnsentContent(existing)) {
@@ -326,6 +351,8 @@ export function chatThreadReducer(state: ChatThreadState, action: ChatThreadActi
         stage: action.session.stage,
         status: action.session.status,
         title: thread.title === "New chat" ? action.session.title : thread.title,
+        // The create resolved, so its key has served its replay purpose.
+        pendingClientSessionId: undefined,
         updatedAt: Date.parse(action.session.updatedAt),
       }));
     case "messageAppended":
@@ -335,6 +362,7 @@ export function chatThreadReducer(state: ChatThreadState, action: ChatThreadActi
         messagesState: "ready",
         sendState: "idle",
         pendingClientMessageId: undefined,
+        pendingClientSessionId: undefined,
         pendingDraft: undefined,
         updatedAt: action.now,
       }));
@@ -354,8 +382,9 @@ export function chatThreadReducer(state: ChatThreadState, action: ChatThreadActi
               sendState: "sending",
               sendError: undefined,
               pendingClientMessageId: action.clientMessageId,
-              // A retry keeps the snapshot its key was created for; the
+              // A retry keeps each snapshot its key was created for; the
               // current draft may have been edited after the failure.
+              pendingClientSessionId: thread.pendingClientSessionId ?? action.clientSessionId,
               pendingDraft: thread.pendingDraft ?? action.draft,
             },
       );
@@ -364,11 +393,12 @@ export function chatThreadReducer(state: ChatThreadState, action: ChatThreadActi
         ...thread,
         sendState: "error",
         sendError: action.message,
-        // A definitive failure proved the append was never stored, so the
-        // next send starts fresh. An ambiguous failure keeps its key and
-        // bound draft so a retry of the same append stays idempotent on
-        // FastAPI and later edits stay out of the retried payload.
+        // A definitive failure proved nothing was stored, so the next send
+        // starts fresh. An ambiguous failure keeps its keys and bound draft
+        // so a retry of the same send replays idempotently on FastAPI and
+        // later edits stay out of the retried payload.
         pendingClientMessageId: action.definitive ? undefined : thread.pendingClientMessageId,
+        pendingClientSessionId: action.definitive ? undefined : thread.pendingClientSessionId,
         pendingDraft: action.definitive ? undefined : thread.pendingDraft,
       }));
     case "sendResolved":
@@ -376,6 +406,7 @@ export function chatThreadReducer(state: ChatThreadState, action: ChatThreadActi
         thread.sendState === "idle" &&
         thread.sendError === undefined &&
         thread.pendingClientMessageId === undefined &&
+        thread.pendingClientSessionId === undefined &&
         thread.pendingDraft === undefined
           ? thread
           : {
@@ -383,6 +414,7 @@ export function chatThreadReducer(state: ChatThreadState, action: ChatThreadActi
               sendState: "idle",
               sendError: undefined,
               pendingClientMessageId: undefined,
+              pendingClientSessionId: undefined,
               pendingDraft: undefined,
               updatedAt: action.now,
             },
