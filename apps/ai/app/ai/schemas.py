@@ -9,6 +9,7 @@ from binascii import Error as Base64DecodeError
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Literal, TypeAlias
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 from pydantic.alias_generators import to_camel
@@ -560,6 +561,19 @@ class TaskPlan(ContractModel):
         return self
 
 
+class SandboxProposalContext(ContractModel):
+    """Exact application-authorized identifiers available to a sandbox proposal."""
+
+    workspace_id: UUID
+    source_file_ids: tuple[UUID, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def source_ids_are_unique(self) -> "SandboxProposalContext":
+        if len(self.source_file_ids) != len(set(self.source_file_ids)):
+            raise ValueError("sandbox source file IDs must be unique")
+        return self
+
+
 class AgentContext(ContractModel):
     """Backend-owned workflow context made available to the AI planner."""
 
@@ -567,6 +581,7 @@ class AgentContext(ContractModel):
     conversation: tuple[ConversationMessage, ...]
     allowed_tools: tuple[ToolDefinition, ...]
     evidence: tuple[EvidenceChunk, ...] = ()
+    sandbox_context: SandboxProposalContext | None = None
 
     @model_validator(mode="after")
     def tool_names_are_unique(self) -> "AgentContext":

@@ -19,6 +19,7 @@ from app.ai.schemas import (
     InputModality,
     KnowledgeQuery,
     ProposedToolCall,
+    SandboxProposalContext,
     TaskDescriptor,
     TaskKind,
     VisualAnalysisRequest,
@@ -399,6 +400,10 @@ class CheckpointAwareWorkflowRunner:
                 task=task,
                 conversation=(ConversationMessage(role="user", content=admission.message.content),),
                 allowed_tools=self._tool_registry.definitions_for(run.workflow_type, run.stage),
+                sandbox_context=SandboxProposalContext(
+                    workspace_id=admission.run.session_id,
+                    source_file_ids=tuple(item.source_id for item in admission.selected_uploads),
+                ),
             )
         )
         if proposal.response_text is not None:
@@ -515,8 +520,9 @@ class CheckpointAwareWorkflowRunner:
         """Store user-safe completion text with a deterministic retry key."""
 
         message_id = uuid5(admission.run.workflow_run_id, completion_key)
-        message = await self._workflows.append_message(
-            WorkflowMessage(
+        await self._workflows.append_assistant_completion(
+            run=admission.run,
+            message=WorkflowMessage(
                 message_id=message_id,
                 session_id=admission.run.session_id,
                 author_user_id=None,
@@ -524,21 +530,8 @@ class CheckpointAwareWorkflowRunner:
                 content=content[:20_000],
                 created_at=datetime.now(UTC),
                 client_message_id=message_id,
-            )
+            ),
         )
-        if self._events is not None:
-            await self._events.append(
-                ActivityEvent(
-                    event_id=0,
-                    session_id=admission.run.session_id,
-                    workflow_run_id=admission.run.workflow_run_id,
-                    event_type=ActivityEventType.MESSAGE_COMPLETED,
-                    occurred_at=message.created_at,
-                    payload={"messageId": str(message.message_id)},
-                ),
-                owner_user_id=admission.run.owner_user_id,
-            )
-
     @staticmethod
     def _validate_draft(
         draft: StoredDraft,

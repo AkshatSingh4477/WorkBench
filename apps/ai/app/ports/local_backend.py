@@ -388,6 +388,15 @@ class WorkflowStore(Protocol):
         """Append a sanitized user or assistant message."""
         ...
 
+    async def append_assistant_completion(
+        self,
+        *,
+        run: WorkflowRun,
+        message: WorkflowMessage,
+    ) -> WorkflowMessage:
+        """Atomically append or replay an assistant message and its completion event."""
+        ...
+
     async def finalize_failure(
         self,
         *,

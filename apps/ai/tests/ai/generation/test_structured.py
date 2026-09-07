@@ -2,6 +2,7 @@
 
 import json
 from collections.abc import Sequence
+from uuid import UUID
 
 import pytest
 from pydantic import JsonValue
@@ -28,6 +29,7 @@ from app.ai.schemas import (
     DraftRequest,
     GroundedDraft,
     ProposedToolCall,
+    SandboxProposalContext,
     TaskPlan,
     TextGenerationRequest,
     TextGenerationResult,
@@ -287,6 +289,10 @@ async def test_tool_proposal_returns_only_an_allowed_validated_call() -> None:
             ConversationMessage(role="user", content="Export the draft as a Word file."),
         ),
         allowed_tools=(export_tool(),),
+        sandbox_context=SandboxProposalContext(
+            workspace_id=UUID("00000000-0000-0000-0000-000000000001"),
+            source_file_ids=(UUID("00000000-0000-0000-0000-000000000002"),),
+        ),
     )
 
     result = await generator.propose_action(context)
@@ -300,7 +306,10 @@ async def test_tool_proposal_returns_only_an_allowed_validated_call() -> None:
     assert request.output_schema == expected_schema
     assert json.dumps(expected_schema, sort_keys=True) in request.user_prompt
     assert "request_document_export" in request.user_prompt
-    assert "tool-proposal-v1" in request.user_prompt
+    assert "tool-proposal-v2" in request.user_prompt
+    assert "APPLICATION-AUTHORIZED SANDBOX CONTEXT" in request.user_prompt
+    assert '"workspaceId": "00000000-0000-0000-0000-000000000001"' in request.user_prompt
+    assert '"sourceFileIds": ["00000000-0000-0000-0000-000000000002"]' in request.user_prompt
     assert request.temperature == 0
 
 

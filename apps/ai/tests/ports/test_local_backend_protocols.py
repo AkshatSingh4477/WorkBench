@@ -80,6 +80,13 @@ def test_workflow_store_exposes_atomic_failure_finalization() -> None:
     assert inspect.iscoroutinefunction(WorkflowStore.finalize_failure)
 
 
+def test_workflow_store_exposes_atomic_assistant_completion() -> None:
+    signature = inspect.signature(WorkflowStore.append_assistant_completion)
+
+    assert tuple(signature.parameters) == ("self", "run", "message")
+    assert inspect.iscoroutinefunction(WorkflowStore.append_assistant_completion)
+
+
 def test_approval_store_exposes_atomic_pending_resolution() -> None:
     """Resolution is compare-and-set so duplicate requests cannot rerun a tool."""
 

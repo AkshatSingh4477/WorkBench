@@ -2771,6 +2771,81 @@ class SQLiteWorkflowStore:
             )
         return message
 
+    async def append_assistant_completion(
+        self,
+        *,
+        run: WorkflowRun,
+        message: WorkflowMessage,
+    ) -> WorkflowMessage:
+        """Atomically append or replay an assistant message and its completion event."""
+
+        if (
+            message.session_id != run.session_id
+            or message.author_user_id is not None
+            or message.role != "assistant"
+            or message.client_message_id != message.message_id
+        ):
+            raise WorkflowRunContextMismatchError("assistant completion context is inconsistent")
+
+        async with self._database.open() as connection:
+            await connection.execute("BEGIN IMMEDIATE")
+            context = await (
+                await connection.execute(
+                    """SELECT 1 FROM workflow_runs AS runs
+                    JOIN workflow_sessions AS sessions USING(session_id)
+                    WHERE runs.workflow_run_id = ? AND runs.session_id = ?
+                      AND runs.owner_user_id = ? AND runs.workflow_type = ?
+                      AND sessions.owner_user_id = runs.owner_user_id""",
+                    (
+                        str(run.workflow_run_id),
+                        str(run.session_id),
+                        str(run.owner_user_id),
+                        run.workflow_type.value,
+                    ),
+                )
+            ).fetchone()
+            if context is None:
+                raise WorkflowRunContextMismatchError("assistant completion run is unavailable")
+
+            stored = await self._stored_idempotent_message(connection, message)
+            if stored is None:
+                await self._insert_message(connection, message)
+                await connection.execute(
+                    """UPDATE workflow_sessions SET updated_at = ?
+                    WHERE session_id = ? AND owner_user_id = ?""",
+                    (
+                        message.created_at.isoformat(),
+                        str(message.session_id),
+                        str(run.owner_user_id),
+                    ),
+                )
+                stored = message
+
+            completion_event = ActivityEvent(
+                event_id=0,
+                session_id=run.session_id,
+                workflow_run_id=run.workflow_run_id,
+                event_type=ActivityEventType.MESSAGE_COMPLETED,
+                occurred_at=stored.created_at,
+                payload={"messageId": str(stored.message_id)},
+            )
+            payload_json = SQLiteActivityEventStore._serialize_payload(completion_event.payload)
+            existing_event = await (
+                await connection.execute(
+                    """SELECT 1 FROM activity_events
+                    WHERE session_id = ? AND workflow_run_id = ?
+                      AND event_type = 'message.completed' AND payload_json = ?""",
+                    (str(run.session_id), str(run.workflow_run_id), payload_json),
+                )
+            ).fetchone()
+            if existing_event is None:
+                await _insert_activity_event(
+                    connection,
+                    completion_event,
+                    owner_user_id=run.owner_user_id,
+                )
+            return stored
+
     async def _stored_idempotent_message(
         self, connection: aiosqlite.Connection, message: WorkflowMessage
     ) -> WorkflowMessage | None:

@@ -12,6 +12,7 @@ import aiosqlite
 import pytest
 from pydantic import JsonValue, ValidationError
 
+from app.ports.local_backend import WorkflowMessage
 from app.storage import (
     ActivityEventContextMismatchError,
     LocalSQLiteDatabase,
@@ -350,6 +351,54 @@ async def test_message_completed_event_is_idempotent_per_workflow_run(tmp_path: 
 
     assert replayed == created
     assert events == [created]
+
+
+@pytest.mark.asyncio
+async def test_assistant_completion_message_and_event_commit_atomically(tmp_path: Path) -> None:
+    """A completion-event fault must not leave message history ahead of SSE replay."""
+
+    database, workflows, events, session, run = await _stores(tmp_path)
+    message_id = uuid4()
+    message = WorkflowMessage(
+        message_id=message_id,
+        session_id=session.session_id,
+        author_user_id=None,
+        role="assistant",
+        content="The validated draft is ready for approval.",
+        created_at=_OCCURRED_AT,
+        client_message_id=message_id,
+    )
+    async with database.open() as connection:
+        await connection.execute(
+            """CREATE TRIGGER fail_completion BEFORE INSERT ON activity_events
+            WHEN NEW.event_type = 'message.completed'
+            BEGIN SELECT RAISE(ABORT, 'fault'); END"""
+        )
+
+    with pytest.raises(aiosqlite.IntegrityError, match="fault"):
+        await workflows.append_assistant_completion(run=run, message=message)
+
+    assert await workflows.list_messages(session.session_id, session.owner_user_id) == []
+    assert await events.replay(
+        session_id=session.session_id,
+        owner_user_id=session.owner_user_id,
+        after_event_id=0,
+    ) == []
+
+    async with database.open() as connection:
+        await connection.execute("DROP TRIGGER fail_completion")
+    created = await workflows.append_assistant_completion(run=run, message=message)
+    replayed = await workflows.append_assistant_completion(run=run, message=message)
+
+    assert created == replayed == message
+    assert await workflows.list_messages(session.session_id, session.owner_user_id) == [message]
+    completion_events = await events.replay(
+        session_id=session.session_id,
+        owner_user_id=session.owner_user_id,
+        after_event_id=0,
+    )
+    assert len(completion_events) == 1
+    assert completion_events[0].payload == {"messageId": str(message_id)}
 
 
 @pytest.mark.asyncio

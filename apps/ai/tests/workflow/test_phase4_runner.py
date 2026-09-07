@@ -11,6 +11,7 @@ import pytest
 
 from app.ai.fakes import FakeAIEngine
 from app.ai.schemas import (
+    AgentContext,
     AgentProposal,
     Capability,
     CapabilityDecision,
@@ -277,7 +278,14 @@ async def test_code_repair_creates_only_a_pending_sandbox_approval(tmp_path: Pat
         content=b"print('local')\n",
     )
     upload = admission.selected_uploads[0]
-    ai = FakeAIEngine(
+    class CapturingCodeEngine(FakeAIEngine):
+        proposed_context: AgentContext | None = None
+
+        async def propose_action(self, request: AgentContext) -> AgentProposal:
+            self.proposed_context = request
+            return await super().propose_action(request)
+
+    ai = CapturingCodeEngine(
         capability_decision=CapabilityDecision(
             capability=Capability.TEXT, selected_model="qwen3:4b", reason="Local code task."
         ),
@@ -315,6 +323,10 @@ async def test_code_repair_creates_only_a_pending_sandbox_approval(tmp_path: Pat
     assert approval.tool_name == "run_sandbox"
     assert approval.status.value == "pending"
     assert any(call.startswith("propose_action:") for call in ai.calls)
+    assert ai.proposed_context is not None
+    assert ai.proposed_context.sandbox_context is not None
+    assert ai.proposed_context.sandbox_context.workspace_id == admission.run.session_id
+    assert ai.proposed_context.sandbox_context.source_file_ids == (upload.source_id,)
 
 
 @pytest.mark.asyncio
