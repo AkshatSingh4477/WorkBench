@@ -29,6 +29,7 @@ from app.ports.local_backend import (
 )
 from app.tools.registry import ToolRegistry
 from app.workflow.runner import WorkflowRunner
+from app.workflow.supervisor import WorkflowTaskSupervisor
 
 ShutdownCallback = Callable[[], Awaitable[None]]
 StartupCallback = Callable[[], Awaitable[None]]
@@ -54,6 +55,7 @@ class ApplicationDependencies:
     draft_store: DraftStore | None = None
     sandbox_executor: SandboxExecutor | None = None
     workflow_runner: WorkflowRunner | None = None
+    workflow_supervisor: WorkflowTaskSupervisor | None = None
     tool_registry: ToolRegistry | None = None
     deployment_proof: LocalDeploymentProof | None = None
     shutdown: ShutdownCallback | None = None

@@ -259,7 +259,16 @@ def build_chat_router() -> APIRouter:
             if approved is None or stored is None:
                 return _error("upload_not_found", "A selected upload is unavailable.", 404)
             snapshots.append(
-                SelectedUploadSnapshot(**stored.model_dump(), owner_user_id=user.user_id)
+                SelectedUploadSnapshot(
+                    upload_id=stored.upload_id,
+                    session_id=stored.session_id,
+                    owner_user_id=user.user_id,
+                    source_id=stored.source_id,
+                    file_name=stored.file_name,
+                    mime_type=stored.mime_type,
+                    size_bytes=stored.size_bytes,
+                    sha256=stored.sha256,
+                )
             )
         now = datetime.now(UTC)
         try:

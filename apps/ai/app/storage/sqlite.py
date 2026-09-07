@@ -1685,9 +1685,7 @@ class SQLiteWorkflowStore:
                 "session already has different nonterminal work"
             ) from error
 
-    async def get_admission(
-        self, *, workflow_run_id: UUID
-    ) -> WorkflowRunAdmission | None:
+    async def get_admission(self, *, workflow_run_id: UUID) -> WorkflowRunAdmission | None:
         """Restore one committed admission with its original user message."""
 
         async with self._database.open() as connection:
@@ -1750,7 +1748,7 @@ class SQLiteWorkflowStore:
     ) -> None:
         row = await (
             await connection.execute(
-                """SELECT workflow_type, status FROM workflow_sessions
+                """SELECT workflow_type, stage, status FROM workflow_sessions
                 WHERE session_id = ? AND owner_user_id = ?""",
                 (str(request.run.session_id), str(request.run.owner_user_id)),
             )
@@ -1758,6 +1756,7 @@ class SQLiteWorkflowStore:
         if (
             row is None
             or row["workflow_type"] != request.run.workflow_type.value
+            or row["stage"] != WorkflowStage.COLLECTING_INPUTS.value
             or row["status"] != WorkflowStatus.ACTIVE.value
         ):
             raise WorkflowRunContextMismatchError("admission requires an active owned session")
@@ -2209,6 +2208,23 @@ class SQLiteWorkflowStore:
                 if cursor.rowcount != 1:
                     raise WorkflowApprovalConflictError("workflow transition lost its race")
                 await self._update_projection(connection, next_run)
+                stage_changed_event = await _insert_activity_event(
+                    connection,
+                    ActivityEvent(
+                        event_id=0,
+                        session_id=run.session_id,
+                        workflow_run_id=run.workflow_run_id,
+                        event_type=ActivityEventType.STAGE_CHANGED,
+                        occurred_at=approval.requested_at,
+                        payload={
+                            "previousStage": run.stage.value,
+                            "stage": next_run.stage.value,
+                            "stageVersion": next_run.stage_version,
+                            "status": next_run.status.value,
+                        },
+                    ),
+                    owner_user_id=run.owner_user_id,
+                )
                 event = await _insert_activity_event(
                     connection,
                     ActivityEvent(
@@ -2225,6 +2241,7 @@ class SQLiteWorkflowStore:
                     run=next_run,
                     approval=approval,
                     output=output,
+                    stage_changed_event=stage_changed_event,
                     required_event=event,
                     created_now=True,
                 )
@@ -2286,12 +2303,21 @@ class SQLiteWorkflowStore:
                 (str(run.workflow_run_id),),
             )
         ).fetchone()
-        if current is None or event_row is None:
+        stage_event_row = await (
+            await connection.execute(
+                """SELECT * FROM activity_events WHERE workflow_run_id = ?
+                AND event_type = 'workflow.stageChanged'
+                ORDER BY event_id DESC LIMIT 1""",
+                (str(run.workflow_run_id),),
+            )
+        ).fetchone()
+        if current is None or event_row is None or stage_event_row is None:
             raise WorkflowApprovalConflictError("prepared approval is incomplete")
         return PendingApprovalPreparation(
             run=self._workflow_run_from_row(current),
             approval=stored_approval,
             output=output,
+            stage_changed_event=SQLiteActivityEventStore._event_from_row(stage_event_row),
             required_event=SQLiteActivityEventStore._event_from_row(event_row),
             created_now=False,
         )
@@ -2729,9 +2755,7 @@ class SQLiteWorkflowStore:
             ).fetchall()
         return [self._workflow_run_from_row(row) for row in rows]
 
-    async def get_run_inputs(
-        self, *, workflow_run_id: UUID
-    ) -> tuple[SelectedUploadSnapshot, ...]:
+    async def get_run_inputs(self, *, workflow_run_id: UUID) -> tuple[SelectedUploadSnapshot, ...]:
         """Return persisted selected uploads for a workflow run."""
 
         async with self._database.open() as connection:

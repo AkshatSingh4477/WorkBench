@@ -6,7 +6,6 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
-from uuid import uuid4
 
 import uvicorn
 from fastapi import APIRouter, FastAPI, Request
@@ -21,17 +20,13 @@ from app.api.chat import build_chat_router
 from app.api.contracts import ErrorResponse
 from app.api.health_contracts import HealthResponse, HealthStatus
 from app.api.sessions import build_session_router
+from app.api.workflow_messages import build_workflow_message_router
 from app.artifacts import LibreOfficePdfConverter, LocalDocumentArtifactExecutor
 from app.auth.service import AuthError, AuthService
 from app.config import ApplicationSettings
 from app.health import ApplicationDependencies, build_health_response
 from app.local_health import LocalSystemHealthProvider
-from app.ports.local_backend import (
-    LocalDeploymentProof,
-    WorkflowAdmissionStatus,
-    WorkflowMessage,
-    WorkflowRunAdmission,
-)
+from app.ports.local_backend import LocalDeploymentProof
 from app.sandbox import DockerSandboxExecutor
 from app.storage import (
     LocalKnowledgeSourceStore,
@@ -49,13 +44,16 @@ from app.storage import (
 )
 from app.tools.registry import ToolRegistry
 from app.workflow.contracts import (
-    ActivityEvent,
-    ActivityEventType,
     WorkflowRun,
     WorkflowRunStatus,
     WorkflowStage,
 )
-from app.workflow.runner import CheckpointAwareWorkflowRunner, InspectionWorkflowInputPolicy
+from app.workflow.runner import (
+    CheckpointAwareWorkflowRunner,
+    InspectionWorkflowInputPolicy,
+    LocalInspectionWorkflowInputPolicy,
+)
+from app.workflow.supervisor import WorkflowTaskSupervisor
 
 
 def _health_router(
@@ -140,19 +138,18 @@ def compose_runtime_dependencies(
     sandbox_executor = DockerSandboxExecutor(database, files, settings)
     ai_engine = create_local_ai_engine(knowledge_root=knowledge.approved_knowledge_root())
     tool_registry = ToolRegistry(approvals, artifact_executor, sandbox_executor)
-    workflow_runner = (
-        CheckpointAwareWorkflowRunner(
-            workflows=workflow_store,
-            drafts=drafts,
-            approvals=approvals,
-            ai_engine=ai_engine,
-            tool_registry=tool_registry,
-            input_policy=workflow_input_policy,
-            lease_seconds=settings.workflow_lease_seconds,
-        )
-        if workflow_input_policy is not None
-        else None
+    input_policy = workflow_input_policy or LocalInspectionWorkflowInputPolicy(files)
+    workflow_runner = CheckpointAwareWorkflowRunner(
+        workflows=workflow_store,
+        drafts=drafts,
+        approvals=approvals,
+        ai_engine=ai_engine,
+        tool_registry=tool_registry,
+        input_policy=input_policy,
+        events=SQLiteActivityEventStore(database),
+        lease_seconds=settings.workflow_lease_seconds,
     )
+    workflow_supervisor = WorkflowTaskSupervisor(workflow_runner.run)
 
     async def fail_recovery_run(run: WorkflowRun) -> None:
         """Terminally fail one unrecoverable run through the typed store boundary."""
@@ -196,7 +193,7 @@ def compose_runtime_dependencies(
                 if admission is None:
                     await fail_recovery_run(queued_run)
                     continue
-                await workflow_runner.run(admission)
+                workflow_supervisor.submit(admission)
             except Exception:
                 await fail_recovery_run(queued_run)
         for stale_run in interrupted:
@@ -207,37 +204,20 @@ def compose_runtime_dependencies(
             )
             if claimed is None:
                 continue
-            if workflow_runner is None:
-                await fail_recovery_run(claimed)
-                continue
             try:
-                selected_uploads = await workflow_store.get_run_inputs(
-                    workflow_run_id=claimed.workflow_run_id,
+                admission = await workflow_store.get_admission(
+                    workflow_run_id=claimed.workflow_run_id
                 )
-                synthetic_message = WorkflowMessage(
-                    message_id=uuid4(),
-                    session_id=claimed.session_id,
-                    author_user_id=claimed.owner_user_id,
-                    role="user",
-                    content="[startup recovery]",
-                    created_at=now,
-                )
-                admission = WorkflowRunAdmission(
-                    status=WorkflowAdmissionStatus.CREATED,
-                    run=claimed,
-                    message=synthetic_message,
-                    selected_uploads=selected_uploads,
-                    accepted_event=ActivityEvent(
-                        event_id=0,
-                        session_id=claimed.session_id,
-                        workflow_run_id=claimed.workflow_run_id,
-                        event_type=ActivityEventType.MESSAGE_ACCEPTED,
-                        occurred_at=now,
-                    ),
-                )
-                await workflow_runner.run(admission)
+                if admission is None:
+                    await fail_recovery_run(claimed)
+                    continue
+                workflow_supervisor.submit(admission)
             except Exception:
                 await fail_recovery_run(claimed)
+
+    async def _shutdown() -> None:
+        await workflow_supervisor.shutdown()
+        await ai_engine.close()
 
     return ApplicationDependencies(
         ai_engine=ai_engine,
@@ -256,6 +236,7 @@ def compose_runtime_dependencies(
         draft_store=drafts,
         sandbox_executor=sandbox_executor,
         workflow_runner=workflow_runner,
+        workflow_supervisor=workflow_supervisor,
         tool_registry=tool_registry,
         deployment_proof=LocalDeploymentProof(
             model_endpoint_classification="loopback",
@@ -263,7 +244,7 @@ def compose_runtime_dependencies(
             docker_available=shutil.which(settings.docker_executable) is not None,
         ),
         startup=_startup_with_recovery,
-        shutdown=ai_engine.close,
+        shutdown=_shutdown,
     )
 
 
@@ -355,6 +336,7 @@ def create_app(
     application.state.session_file_store = resolved_dependencies.session_file_store
     application.state.activity_event_store = resolved_dependencies.activity_event_store
     application.state.workflow_runner = resolved_dependencies.workflow_runner
+    application.state.workflow_supervisor = resolved_dependencies.workflow_supervisor
     application.state.upload_max_bytes = resolved_settings.upload_max_bytes
     application.add_exception_handler(RequestValidationError, _validation_error_handler)
     application.add_exception_handler(AuthError, _auth_error_handler)
@@ -362,6 +344,7 @@ def create_app(
     application.include_router(_health_router(resolved_settings, resolved_dependencies))
     application.include_router(build_auth_router(resolved_settings))
     application.include_router(build_session_router())
+    application.include_router(build_workflow_message_router())
     application.include_router(build_chat_router())
     return application
 

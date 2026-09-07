@@ -164,6 +164,7 @@ class PendingApprovalPreparation(ApiContractModel):
     run: WorkflowRun
     approval: Approval
     output: ValidatedToolCall
+    stage_changed_event: ActivityEvent
     required_event: ActivityEvent
     created_now: bool
 
@@ -321,9 +322,7 @@ class WorkflowStore(Protocol):
 
     async def admit_run(self, request: WorkflowRunAdmissionRequest) -> WorkflowRunAdmission: ...
 
-    async def get_admission(
-        self, *, workflow_run_id: UUID
-    ) -> WorkflowRunAdmission | None:
+    async def get_admission(self, *, workflow_run_id: UUID) -> WorkflowRunAdmission | None:
         """Restore one atomically persisted admission for recovery."""
         ...
 
