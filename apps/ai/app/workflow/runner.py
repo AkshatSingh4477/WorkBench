@@ -407,9 +407,6 @@ class CheckpointAwareWorkflowRunner:
             )
         )
         if proposal.response_text is not None:
-            await self._persist_assistant(
-                admission, proposal.response_text, completion_key="assistant-response"
-            )
             raise WorkflowRunnerStateError("code workflow did not produce an approval proposal")
         if proposal.tool_call is None:
             raise WorkflowRunnerStateError("code workflow returned an invalid proposal")
@@ -514,12 +511,10 @@ class CheckpointAwareWorkflowRunner:
         self,
         admission: WorkflowRunAdmission,
         content: str,
-        *,
-        completion_key: str = "assistant-completion",
     ) -> None:
         """Store user-safe completion text with a deterministic retry key."""
 
-        message_id = uuid5(admission.run.workflow_run_id, completion_key)
+        message_id = uuid5(admission.run.workflow_run_id, "assistant-completion")
         await self._workflows.append_assistant_completion(
             run=admission.run,
             message=WorkflowMessage(

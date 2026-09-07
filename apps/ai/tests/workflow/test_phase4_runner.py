@@ -636,10 +636,10 @@ async def test_malformed_code_proposal_is_a_policy_failure_not_an_internal_error
 
 
 @pytest.mark.asyncio
-async def test_code_response_and_failure_have_distinct_durable_completions(
+async def test_rejected_code_response_exposes_only_the_safe_failure_completion(
     tmp_path: Path,
 ) -> None:
-    """A planner response and the policy failure that follows must both remain observable."""
+    """Invalid model output must not appear as a successful assistant completion."""
 
     workflows, drafts, approvals, events, files, admission = await _admit(
         tmp_path,
@@ -671,7 +671,6 @@ async def test_code_response_and_failure_have_distinct_durable_completions(
     )
     assert [message.content for message in messages] == [
         admission.message.content,
-        "The selected validator needs review.",
         "The workflow could not complete. Please review the activity trace.",
     ]
     completed = [
@@ -683,5 +682,5 @@ async def test_code_response_and_failure_have_distinct_durable_completions(
         )
         if event.event_type is ActivityEventType.MESSAGE_COMPLETED
     ]
-    assert len(completed) == 2
-    assert completed[0].payload["messageId"] != completed[1].payload["messageId"]
+    assert len(completed) == 1
+    assert completed[0].payload["messageId"] == str(messages[-1].message_id)
