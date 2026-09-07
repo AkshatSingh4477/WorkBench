@@ -212,18 +212,37 @@ def test_message_admission_is_async_idempotent_and_owner_scoped(tmp_path: Path) 
         )
         assert created.status_code == 201
         session_id = created.json()["sessionId"]
+        missing_source = client.post(
+            f"/sessions/{session_id}/messages",
+            headers=_headers(),
+            json={"content": "Review the validator", "clientMessageId": str(uuid4())},
+        )
+        uploaded = client.post(
+            f"/sessions/{session_id}/uploads",
+            headers=_headers(),
+            files={"file": ("validator.py", b"print('local')\n", "text/x-python")},
+        )
+        assert uploaded.status_code == 201
         client_message_id = str(uuid4())
         started = time.monotonic()
         accepted = client.post(
             f"/sessions/{session_id}/messages",
             headers=_headers(),
-            json={"content": "Review the validator", "clientMessageId": client_message_id},
+            json={
+                "content": "Review the validator",
+                "clientMessageId": client_message_id,
+                "selectedUploadIds": [uploaded.json()["uploadId"]],
+            },
         )
         elapsed = time.monotonic() - started
         replayed = client.post(
             f"/sessions/{session_id}/messages",
             headers=_headers(),
-            json={"content": "Review the validator", "clientMessageId": client_message_id},
+            json={
+                "content": "Review the validator",
+                "clientMessageId": client_message_id,
+                "selectedUploadIds": [uploaded.json()["uploadId"]],
+            },
         )
         _login(client, "engineer.two")
         foreign = client.post(
@@ -234,6 +253,8 @@ def test_message_admission_is_async_idempotent_and_owner_scoped(tmp_path: Path) 
         time.sleep(0.05)
 
     assert elapsed < 0.15
+    assert missing_source.status_code == 422
+    assert missing_source.json()["code"] == "code_source_required"
     assert accepted.status_code == replayed.status_code == 202
     assert accepted.json() == replayed.json()
     assert accepted.json()["status"] == "queued"

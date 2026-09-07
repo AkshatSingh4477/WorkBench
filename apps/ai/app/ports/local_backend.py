@@ -348,6 +348,19 @@ class WorkflowStore(Protocol):
         self, *, stale_before: UtcTimestamp, interrupted_at: UtcTimestamp
     ) -> list[WorkflowRun]: ...
 
+    async def mark_run_interrupted(
+        self,
+        *,
+        workflow_run_id: UUID,
+        session_id: UUID,
+        owner_user_id: UUID,
+        expected_stage: WorkflowStage,
+        expected_stage_version: int,
+        interrupted_at: UtcTimestamp,
+    ) -> WorkflowRun | None:
+        """Make one cancelled active run immediately eligible for restart recovery."""
+        ...
+
     async def claim_retry(
         self, *, workflow_run_id: UUID, expected_stage_version: int, lease_expires_at: UtcTimestamp
     ) -> WorkflowRun | None: ...

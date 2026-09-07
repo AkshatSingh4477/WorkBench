@@ -179,11 +179,12 @@ def compose_runtime_dependencies(
     async def _startup_with_recovery() -> None:
         await database.initialize()
         now = datetime.now(UTC)
-        interrupted = await workflow_store.mark_stale_runs_interrupted(
+        await workflow_store.mark_stale_runs_interrupted(
             stale_before=now - timedelta(seconds=settings.workflow_lease_seconds),
             interrupted_at=now,
         )
-        for queued_run in await workflow_store.list_unfinished_runs():
+        unfinished_runs = await workflow_store.list_unfinished_runs()
+        for queued_run in unfinished_runs:
             if queued_run.status is not WorkflowRunStatus.QUEUED or workflow_runner is None:
                 continue
             try:
@@ -196,7 +197,9 @@ def compose_runtime_dependencies(
                 workflow_supervisor.submit(admission)
             except Exception:
                 await fail_recovery_run(queued_run)
-        for stale_run in interrupted:
+        for stale_run in unfinished_runs:
+            if stale_run.status is not WorkflowRunStatus.ACTIVE or not stale_run.retryable:
+                continue
             claimed = await workflow_store.claim_retry(
                 workflow_run_id=stale_run.workflow_run_id,
                 expected_stage_version=stale_run.stage_version,

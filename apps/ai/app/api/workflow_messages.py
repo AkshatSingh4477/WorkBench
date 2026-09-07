@@ -23,7 +23,7 @@ from app.ports.local_backend import (
 )
 from app.storage import WorkflowSessionNotFoundError
 from app.storage.sqlite import WorkflowAdmissionConflictError, WorkflowRunContextMismatchError
-from app.workflow.contracts import WorkflowRun, WorkflowRunStatus, WorkflowStage
+from app.workflow.contracts import WorkflowRun, WorkflowRunStatus, WorkflowStage, WorkflowType
 from app.workflow.supervisor import WorkflowTaskSupervisor
 
 _UNAVAILABLE = ("workflow_unavailable", "The local workflow service is unavailable.")
@@ -120,10 +120,16 @@ def build_workflow_message_router() -> APIRouter:
         except Exception:
             return _error(*_UNAVAILABLE, status.HTTP_503_SERVICE_UNAVAILABLE)
 
-        if session.workflow_type.value == "inspectionAnalysis" and not snapshots:
+        if session.workflow_type is WorkflowType.INSPECTION_ANALYSIS and not snapshots:
             return _error(
                 "inspection_input_required",
                 "Inspection analysis requires at least one selected inspection upload.",
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+            )
+        if session.workflow_type is WorkflowType.CODE_REPAIR and not snapshots:
+            return _error(
+                "code_source_required",
+                "Code repair requires at least one selected source upload.",
                 status.HTTP_422_UNPROCESSABLE_CONTENT,
             )
 

@@ -44,6 +44,7 @@ from app.workflow.contracts import (
     WorkflowType,
 )
 from app.workflow.runner import CheckpointAwareWorkflowRunner, LocalInspectionWorkflowInputPolicy
+from app.workflow.supervisor import WorkflowTaskSupervisor
 
 NOW = datetime(2026, 9, 7, 12, tzinfo=UTC)
 
@@ -397,9 +398,18 @@ async def test_restart_recovery_resumes_the_original_durable_user_message(
         next_stage=WorkflowStage.PLANNING,
         next_status=WorkflowRunStatus.ACTIVE,
         sandbox_attempts=0,
-        lease_expires_at=now - timedelta(hours=1),
+        lease_expires_at=now + timedelta(hours=1),
     )
     assert active is not None
+    interrupted = await workflows.mark_run_interrupted(
+        workflow_run_id=active.workflow_run_id,
+        session_id=active.session_id,
+        owner_user_id=active.owner_user_id,
+        expected_stage=active.stage,
+        expected_stage_version=active.stage_version,
+        interrupted_at=now,
+    )
+    assert interrupted is not None and interrupted.retryable
 
     class CapturingRecoveryEngine:
         def __init__(self) -> None:
@@ -437,3 +447,110 @@ async def test_restart_recovery_resumes_the_original_durable_user_message(
             await asyncio.sleep(0.01)
 
     assert engine.summaries == [original_content]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancellation_makes_an_active_run_immediately_retryable(
+    tmp_path: Path,
+) -> None:
+    """A bounded shutdown cannot strand a run behind a still-valid execution lease."""
+
+    workflows, drafts, approvals, events, files, admission = await _admit(
+        tmp_path,
+        WorkflowType.CODE_REPAIR,
+        file_name="validator.py",
+        mime_type="text/x-python",
+        content=b"print('local')\n",
+    )
+    planning_started = asyncio.Event()
+
+    class BlockingCodeEngine:
+        async def choose_capability(self, task: TaskDescriptor) -> CapabilityDecision:
+            del task
+            return CapabilityDecision(
+                capability=Capability.TEXT,
+                selected_model="qwen3:4b",
+                reason="Local code task.",
+            )
+
+        async def propose_action(self, request: object) -> AgentProposal:
+            del request
+            planning_started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("the supervisor should cancel before a proposal returns")
+
+    runner = CheckpointAwareWorkflowRunner(
+        workflows=workflows,
+        drafts=drafts,
+        approvals=approvals,
+        ai_engine=cast(Any, BlockingCodeEngine()),
+        tool_registry=ToolRegistry(cast(Any, approvals), cast(Any, object()), cast(Any, object())),
+        input_policy=LocalInspectionWorkflowInputPolicy(files),
+        events=events,
+    )
+    supervisor = WorkflowTaskSupervisor(runner.run)
+    supervisor.submit(admission)
+    await asyncio.wait_for(planning_started.wait(), timeout=1)
+
+    await supervisor.shutdown(timeout_seconds=0)
+
+    current = await workflows.get_run(
+        workflow_run_id=admission.run.workflow_run_id,
+        session_id=admission.run.session_id,
+        owner_user_id=admission.run.owner_user_id,
+    )
+    assert current is not None
+    assert current.status is WorkflowRunStatus.ACTIVE
+    assert current.retryable is True
+    assert current.execution_lease_expires_at is None
+
+
+@pytest.mark.asyncio
+async def test_malformed_code_proposal_is_a_policy_failure_not_an_internal_error(
+    tmp_path: Path,
+) -> None:
+    """A malformed planner result is rejected even when Python assertions are disabled."""
+
+    workflows, drafts, approvals, events, files, admission = await _admit(
+        tmp_path,
+        WorkflowType.CODE_REPAIR,
+        file_name="validator.py",
+        mime_type="text/x-python",
+        content=b"print('local')\n",
+    )
+    class MalformedProposalEngine:
+        async def choose_capability(self, task: TaskDescriptor) -> CapabilityDecision:
+            del task
+            return CapabilityDecision(
+                capability=Capability.TEXT,
+                selected_model="qwen3:4b",
+                reason="Local code task.",
+            )
+
+        async def propose_action(self, request: object) -> AgentProposal:
+            del request
+            return AgentProposal.model_construct(response_text=None, tool_call=None)
+
+    ai = MalformedProposalEngine()
+    runner = CheckpointAwareWorkflowRunner(
+        workflows=workflows,
+        drafts=drafts,
+        approvals=approvals,
+        ai_engine=cast(Any, ai),
+        tool_registry=ToolRegistry(cast(Any, approvals), cast(Any, object()), cast(Any, object())),
+        input_policy=LocalInspectionWorkflowInputPolicy(files),
+        events=events,
+    )
+
+    await runner.run(admission)
+
+    failed_events = [
+        event
+        for event in await events.replay(
+            session_id=admission.run.session_id,
+            owner_user_id=admission.run.owner_user_id,
+            after_event_id=0,
+        )
+        if event.event_type is ActivityEventType.WORKFLOW_FAILED
+    ]
+    assert failed_events[-1].payload["failureCode"] == "workflow_validation_failed"

@@ -328,6 +328,31 @@ async def test_append_round_trips_canonical_payload_after_restart(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_message_completed_event_is_idempotent_per_workflow_run(tmp_path: Path) -> None:
+    """Recovery retries must not notify SSE consumers twice for one assistant message."""
+
+    _, _, store, session, run = await _stores(tmp_path)
+    message_id = uuid4()
+    event = _event(
+        session,
+        workflow_run_id=run.workflow_run_id,
+        event_type=ActivityEventType.MESSAGE_COMPLETED,
+        payload={"messageId": str(message_id)},
+    )
+
+    created = await store.append(event, owner_user_id=session.owner_user_id)
+    replayed = await store.append(event, owner_user_id=session.owner_user_id)
+    events = await store.replay(
+        session_id=session.session_id,
+        owner_user_id=session.owner_user_id,
+        after_event_id=0,
+    )
+
+    assert replayed == created
+    assert events == [created]
+
+
+@pytest.mark.asyncio
 async def test_append_enforces_owner_and_workflow_run_context(tmp_path: Path) -> None:
     _, workflows, store, session, run = await _stores(tmp_path)
     other = _session(owner_user_id=session.owner_user_id)

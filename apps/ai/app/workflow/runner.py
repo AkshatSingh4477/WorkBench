@@ -260,6 +260,7 @@ class CheckpointAwareWorkflowRunner:
             else:
                 await self._run_code_repair(admission)
         except asyncio.CancelledError:
+            await self._mark_interrupted(admission)
             raise
         except Exception as error:
             await self._fail(admission, self._failure_code(error))
@@ -381,7 +382,8 @@ class CheckpointAwareWorkflowRunner:
         if proposal.response_text is not None:
             await self._persist_assistant(admission, proposal.response_text)
             raise WorkflowRunnerStateError("code workflow did not produce an approval proposal")
-        assert proposal.tool_call is not None
+        if proposal.tool_call is None:
+            raise WorkflowRunnerStateError("code workflow returned an invalid proposal")
         output = self._tool_registry.validate_proposal(
             proposal.tool_call, workflow_type=run.workflow_type, stage=run.stage
         )
@@ -436,6 +438,28 @@ class CheckpointAwareWorkflowRunner:
         if run.status not in {WorkflowRunStatus.QUEUED, WorkflowRunStatus.ACTIVE}:
             raise WorkflowRunnerStateError("workflow run is not resumable")
         return run
+
+    async def _mark_interrupted(self, admission: WorkflowRunAdmission) -> None:
+        """Ensure a shutdown-cancelled active run is immediately recoverable."""
+
+        try:
+            current = await self._workflows.get_run(
+                workflow_run_id=admission.run.workflow_run_id,
+                session_id=admission.run.session_id,
+                owner_user_id=admission.run.owner_user_id,
+            )
+            if current is None or current.status is not WorkflowRunStatus.ACTIVE:
+                return
+            await self._workflows.mark_run_interrupted(
+                workflow_run_id=current.workflow_run_id,
+                session_id=current.session_id,
+                owner_user_id=current.owner_user_id,
+                expected_stage=current.stage,
+                expected_stage_version=current.stage_version,
+                interrupted_at=datetime.now(UTC),
+            )
+        except Exception:
+            return
 
     async def _emit_stage_changed(self, previous: WorkflowRun, current: WorkflowRun) -> None:
         if self._events is None or previous.stage is current.stage:

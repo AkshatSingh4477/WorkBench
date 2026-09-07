@@ -2811,6 +2811,44 @@ class SQLiteWorkflowStore:
             ).fetchall()
         return [self._workflow_run_from_row(row) for row in rows]
 
+    async def mark_run_interrupted(
+        self,
+        *,
+        workflow_run_id: UUID,
+        session_id: UUID,
+        owner_user_id: UUID,
+        expected_stage: WorkflowStage,
+        expected_stage_version: int,
+        interrupted_at: UtcTimestamp,
+    ) -> WorkflowRun | None:
+        """Mark one cancelled active run retryable without waiting for its lease to expire."""
+
+        async with self._database.open() as connection:
+            cursor = await connection.execute(
+                """UPDATE workflow_runs SET interrupted_at = ?, retryable = 1,
+                    execution_lease_expires_at = NULL
+                WHERE workflow_run_id = ? AND session_id = ? AND owner_user_id = ?
+                  AND stage = ? AND stage_version = ?
+                  AND status = 'active' AND retryable = 0""",
+                (
+                    interrupted_at.isoformat(),
+                    str(workflow_run_id),
+                    str(session_id),
+                    str(owner_user_id),
+                    expected_stage.value,
+                    expected_stage_version,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = await (
+                await connection.execute(
+                    f"SELECT {_WORKFLOW_RUN_COLUMNS} FROM workflow_runs WHERE workflow_run_id = ?",
+                    (str(workflow_run_id),),
+                )
+            ).fetchone()
+        return self._workflow_run_from_row(row) if row is not None else None
+
     async def claim_retry(
         self, *, workflow_run_id: UUID, expected_stage_version: int, lease_expires_at: UtcTimestamp
     ) -> WorkflowRun | None:
@@ -2950,6 +2988,22 @@ class SQLiteActivityEventStore:
                     session_id=event.session_id,
                     owner_user_id=owner_user_id,
                 )
+
+            if (
+                event.event_type is ActivityEventType.MESSAGE_COMPLETED
+                and event.workflow_run_id is not None
+            ):
+                existing = await (
+                    await connection.execute(
+                        """SELECT * FROM activity_events
+                        WHERE session_id = ? AND workflow_run_id = ?
+                          AND event_type = 'message.completed'
+                        LIMIT 1""",
+                        (str(event.session_id), str(event.workflow_run_id)),
+                    )
+                ).fetchone()
+                if existing is not None:
+                    return self._event_from_row(existing)
 
             persisted = await _insert_activity_event(connection, event, owner_user_id=owner_user_id)
         return persisted
