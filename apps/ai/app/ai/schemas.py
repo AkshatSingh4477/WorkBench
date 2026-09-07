@@ -14,6 +14,8 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 from pydantic.alias_generators import to_camel
 
+MAX_CONVERSATION_HISTORY_MESSAGES = 40
+
 
 class ContractModel(BaseModel):
     """Base model for strict Python/JSON application boundaries."""
@@ -125,7 +127,6 @@ class ModelProfile(ContractModel):
     text_limits: GenerationLimits
     vision_limits: GenerationLimits
     embedding_batch_size: int = Field(gt=0)
-    chat_history_messages: int = Field(default=24, ge=1, le=200)
 
     @model_validator(mode="after")
     def reject_duplicate_candidates(self) -> ModelProfile:
@@ -530,24 +531,47 @@ class DraftRequest(ContractModel):
 class ConversationMessage(ContractModel):
     """A concise conversation item passed to planning, without hidden reasoning."""
 
-    role: Literal["user", "assistant"]
+    role: str = Field(pattern="^(user|assistant)$")
     content: str = Field(min_length=1)
 
 
 class ConversationRequest(ContractModel):
-    """Bounded ordered chat history supplied by the authenticated API layer."""
+    """One bounded, text-only local conversation turn supplied by Backend 1.
 
-    messages: tuple[ConversationMessage, ...] = Field(min_length=1, max_length=200)
+    Backend 1 owns session persistence and chooses the ordered history.  This
+    contract deliberately rejects oversized history instead of trimming or
+    summarising confidential conversation content without the user's knowledge.
+    """
 
+    session_id: str = Field(min_length=1)
+    user_message: str = Field(min_length=1)
+    history: tuple[ConversationMessage, ...] = Field(
+        default=(),
+        max_length=MAX_CONVERSATION_HISTORY_MESSAGES,
+    )
+    timeout_seconds: float | None = Field(default=None, gt=0)
 
-class ConversationResult(ContractModel):
-    """One complete local text-chat response and content-free inference facts."""
+    @field_validator("user_message")
+    @classmethod
+    def reject_blank_user_message(cls, message: str) -> str:
+        """Reject whitespace-only messages before local inference begins."""
 
-    text: str = Field(min_length=1, max_length=20_000)
-    model: str = Field(min_length=1)
-    metrics: InferenceMetrics
-    used_fallback: bool = False
-    fallback_reason: str | None = None
+        if not message.strip():
+            raise ValueError("conversation user message must not be blank")
+        return message
+
+    @model_validator(mode="after")
+    def require_alternating_completed_history(self) -> ConversationRequest:
+        """Keep the supplied history ordered and ready for the next user turn."""
+
+        if self.history and self.history[0].role != "user":
+            raise ValueError("conversation history must start with a user message")
+        for previous, current in zip(self.history, self.history[1:], strict=False):
+            if previous.role == current.role:
+                raise ValueError("conversation history roles must alternate")
+        if self.history and self.history[-1].role != "assistant":
+            raise ValueError("conversation history must end with an assistant message")
+        return self
 
 
 class PlanStep(ContractModel):
@@ -648,12 +672,14 @@ class TextGenerationRequest(ContractModel):
     temperature: float = Field(default=0, ge=0, le=1)
 
 
-class ChatGenerationRequest(ContractModel):
-    """Low-level non-streaming conversation request for a local model adapter."""
+class ConversationGenerationRequest(ContractModel):
+    """Low-level free-text request for one local conversational model turn."""
 
     model: str = Field(min_length=1)
-    messages: tuple[ConversationMessage, ...] = Field(min_length=1, max_length=200)
+    system_prompt: str = Field(min_length=1)
+    messages: tuple[ConversationMessage, ...] = Field(min_length=1)
     limits: GenerationLimits
+    timeout_seconds: float | None = Field(default=None, gt=0)
     temperature: float = Field(default=0.2, ge=0, le=1)
 
 
@@ -693,6 +719,28 @@ class TextGenerationResult(ContractModel):
     structured_output: JsonValue
     metrics: InferenceMetrics
     done_reason: str | None = None
+    used_fallback: bool = False
+    fallback_reason: str | None = None
+
+
+class ConversationGenerationResult(ContractModel):
+    """Validated free-text output returned by a local conversational model."""
+
+    model: str = Field(min_length=1)
+    text: str = Field(min_length=1)
+    done_reason: str | None = None
+    metrics: InferenceMetrics
+    used_fallback: bool = False
+    fallback_reason: str | None = None
+
+
+class ConversationReply(ContractModel):
+    """A completed assistant reply with non-confidential local inference facts."""
+
+    session_id: str = Field(min_length=1)
+    assistant_text: str = Field(min_length=1)
+    model: str = Field(min_length=1)
+    metrics: InferenceMetrics
     used_fallback: bool = False
     fallback_reason: str | None = None
 

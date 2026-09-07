@@ -4,7 +4,7 @@ import asyncio
 from types import TracebackType
 
 from app.ai.engine import AIEngineDependencies
-from app.ai.generation import StructuredTextGenerator
+from app.ai.generation import LocalConversationGenerator, StructuredTextGenerator
 from app.ai.knowledge.chroma_ingestion import (
     ChromaKnowledgeIngestor,
     create_persistent_chroma_client,
@@ -21,20 +21,21 @@ from app.ai.schemas import (
     AIHealthReport,
     ApprovedKnowledgeRoot,
     CapabilityDecision,
-    ChatGenerationRequest,
     CodeRepairRequest,
     CodeRepairResult,
+    ConversationReply,
     ConversationRequest,
-    ConversationResult,
     DraftRequest,
     EvidenceChunk,
     GroundedDraft,
     IngestionResult,
+    InputModality,
     KnowledgeQuery,
     ModelProfile,
     ModelRuntimeHealth,
     SourceDocument,
     TaskDescriptor,
+    TaskKind,
     TaskPlan,
     VisionAnalysis,
     VisualAnalysisRequest,
@@ -74,6 +75,10 @@ class LocalAIEngine:
             dependencies.model_adapter,
             dependencies.model_profile,
         )
+        self._conversation = LocalConversationGenerator(
+            dependencies.model_adapter,
+            dependencies.model_profile,
+        )
         self._close_lock = asyncio.Lock()
         self._closed = False
 
@@ -93,30 +98,31 @@ class LocalAIEngine:
             knowledge_error=knowledge_error,
         )
 
-    @property
-    def chat_history_limit(self) -> int:
-        """Expose the profile-owned bound used by API persistence queries."""
-
-        return self._dependencies.model_profile.chat_history_messages
-
-    async def chat(self, request: ConversationRequest) -> ConversationResult:
-        """Generate a plain local text reply without entering a workflow."""
-
-        profile = self._dependencies.model_profile
-        if len(request.messages) > profile.chat_history_messages:
-            raise ValueError("conversation history exceeds the configured limit")
-        return await self._dependencies.model_adapter.generate_chat(
-            ChatGenerationRequest(
-                model=profile.text_candidates[0],
-                messages=request.messages,
-                limits=profile.text_limits,
-            )
-        )
-
     async def choose_capability(self, task: TaskDescriptor) -> CapabilityDecision:
         """Route from task facts and current local health without model inference."""
 
         return self._dependencies.router.choose(task, await self.health())
+
+    async def reply_to_conversation(self, request: ConversationRequest) -> ConversationReply:
+        """Generate one ordinary local text reply without agent or tool behavior."""
+
+        decision = await self.choose_capability(
+            TaskDescriptor(
+                task_id=request.session_id,
+                kind=TaskKind.CHAT,
+                summary="Ordinary local text conversation.",
+                modalities=(InputModality.TEXT,),
+            )
+        )
+        reply = await self._conversation.reply(request, model=decision.selected_model)
+        if not decision.used_fallback:
+            return reply
+        return reply.model_copy(
+            update={
+                "used_fallback": True,
+                "fallback_reason": reply.fallback_reason or decision.fallback_reason,
+            }
+        )
 
     async def plan_task(self, request: AgentContext) -> TaskPlan:
         """Return a typed plan without advancing any backend workflow stage."""

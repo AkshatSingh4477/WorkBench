@@ -21,11 +21,12 @@ from app.ai.schemas import (
     AIHealthReport,
     Capability,
     CapabilityDecision,
-    ChatGenerationRequest,
     CodeRepairRequest,
     CodeRepairResult,
+    ConversationGenerationRequest,
+    ConversationGenerationResult,
+    ConversationReply,
     ConversationRequest,
-    ConversationResult,
     DraftRequest,
     EmbeddingRequest,
     EmbeddingResult,
@@ -48,8 +49,8 @@ from app.ai.schemas import (
 
 type FakeEngineOperation = Literal[
     "health",
-    "chat",
     "choose_capability",
+    "reply_to_conversation",
     "plan_task",
     "analyze_visual",
     "ingest_knowledge",
@@ -84,16 +85,6 @@ class FakeModelAdapter:
         self.calls.append(f"health:{profile.profile_id}")
         return self.runtime_health
 
-    async def generate_chat(self, request: ChatGenerationRequest) -> ConversationResult:
-        """Return a deterministic local-chat reply and record the bounded request."""
-
-        self.calls.append(f"generate_chat:{len(request.messages)}")
-        return ConversationResult(
-            text="Deterministic fake chat reply.",
-            model=request.model,
-            metrics=sample_inference_metrics(),
-        )
-
     async def generate_text(self, request: TextGenerationRequest) -> TextGenerationResult:
         """Return deterministic structured text."""
 
@@ -102,6 +93,18 @@ class FakeModelAdapter:
             model=request.model,
             text='{"status":"ok"}',
             structured_output={"status": "ok"},
+            metrics=sample_inference_metrics(),
+        )
+
+    async def generate_conversation(
+        self, request: ConversationGenerationRequest
+    ) -> ConversationGenerationResult:
+        """Return one safe, deterministic conversational reply without Ollama."""
+
+        self.calls.append(f"generate_conversation:{request.model}")
+        return ConversationGenerationResult(
+            model=request.model,
+            text="Deterministic local fake reply.",
             metrics=sample_inference_metrics(),
         )
 
@@ -213,17 +216,9 @@ class FakeAIEngine:
     ingestion_result: IngestionResult | None = None
     action_proposal: AgentProposal | None = None
     code_repair_result: CodeRepairResult | None = None
-    conversation_result: ConversationResult = field(
-        default_factory=lambda: ConversationResult(
-            text="Deterministic fake chat reply.",
-            model="qwen3:4b",
-            metrics=sample_inference_metrics(),
-        )
-    )
-    chat_history_limit: int = 24
+    conversation_reply: ConversationReply | None = None
     failures: dict[FakeEngineOperation, AIError] = field(default_factory=dict)
     calls: list[str] = field(default_factory=list, init=False)
-    conversation_requests: list[ConversationRequest] = field(default_factory=list, init=False)
 
     async def health(self) -> AIHealthReport:
         """Return configured combined health."""
@@ -232,20 +227,26 @@ class FakeAIEngine:
         self._raise_configured_failure("health")
         return self.health_report
 
-    async def chat(self, request: ConversationRequest) -> ConversationResult:
-        """Return the configured plain-chat result without workflow behavior."""
-
-        self.calls.append(f"chat:{len(request.messages)}")
-        self.conversation_requests.append(request)
-        self._raise_configured_failure("chat")
-        return self.conversation_result
-
     async def choose_capability(self, task: TaskDescriptor) -> CapabilityDecision:
         """Return a deterministic fake capability selection."""
 
         self.calls.append(f"choose_capability:{task.task_id}")
         self._raise_configured_failure("choose_capability")
         return self.capability_decision
+
+    async def reply_to_conversation(self, request: ConversationRequest) -> ConversationReply:
+        """Return a configured local reply without inference, files, or tools."""
+
+        self.calls.append(f"reply_to_conversation:{request.session_id}")
+        self._raise_configured_failure("reply_to_conversation")
+        if self.conversation_reply is not None:
+            return self.conversation_reply
+        return ConversationReply(
+            session_id=request.session_id,
+            assistant_text="Deterministic local fake reply.",
+            model="qwen3:4b",
+            metrics=sample_inference_metrics(),
+        )
 
     async def plan_task(self, request: AgentContext) -> TaskPlan:
         """Return a bounded fake plan without taking any workflow action."""

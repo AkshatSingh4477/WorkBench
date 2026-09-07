@@ -9,8 +9,8 @@ from app.ai.models.ports import ModelAdapter
 from app.ai.models.structured_output import validate_structured_output
 from app.ai.schemas import (
     Capability,
-    ChatGenerationRequest,
-    ConversationResult,
+    ConversationGenerationRequest,
+    ConversationGenerationResult,
     EmbeddingRequest,
     EmbeddingResult,
     InferenceMetrics,
@@ -92,10 +92,16 @@ class ObservedModelAdapter:
         self._validate_result(Capability.TEXT, request.output_schema, result)
         return result
 
-    async def generate_chat(self, request: ChatGenerationRequest) -> ConversationResult:
-        """Record safe facts for plain chat without retaining conversation content."""
+    async def generate_conversation(
+        self, request: ConversationGenerationRequest
+    ) -> ConversationGenerationResult:
+        """Observe ordinary text chat without retaining conversation content."""
 
-        result = await self._adapter.generate_chat(request)
+        try:
+            result = await self._adapter.generate_conversation(request)
+        except InvalidStructuredOutput as error:
+            self._record_invalid_output(Capability.TEXT, error)
+            raise
         self._record_fallback(result.used_fallback)
         self._record_inference(Capability.TEXT, result.model, result.metrics)
         return result

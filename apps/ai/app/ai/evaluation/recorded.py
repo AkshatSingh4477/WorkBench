@@ -4,8 +4,8 @@ import json
 
 from app.ai.evaluation.samples import sample_inference_metrics, sample_runtime_health
 from app.ai.schemas import (
-    ChatGenerationRequest,
-    ConversationResult,
+    ConversationGenerationRequest,
+    ConversationGenerationResult,
     EmbeddingRequest,
     EmbeddingResult,
     Finding,
@@ -180,11 +180,16 @@ class GoldenRecordedModelAdapter:
         )
         return _text_result(request.model, draft)
 
-    async def generate_chat(self, request: ChatGenerationRequest) -> ConversationResult:
-        """Keep golden workflow fixtures separate from endpoint chat behavior."""
+    async def generate_conversation(
+        self, request: ConversationGenerationRequest
+    ) -> ConversationGenerationResult:
+        """Satisfy the shared adapter seam without inspecting golden chat content."""
 
-        del request
-        raise AssertionError("plain chat is not part of the recorded golden workflow")
+        return ConversationGenerationResult(
+            model=request.model,
+            text="Recorded local conversation reply.",
+            metrics=sample_inference_metrics(),
+        )
 
     async def generate_vision(self, request: VisionGenerationRequest) -> TextGenerationResult:
         metadata = _source_metadata(request.user_prompt)

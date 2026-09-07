@@ -1,5 +1,6 @@
 """Contract tests for local Ollama model operations and fallback behavior."""
 
+import asyncio
 import json
 from collections.abc import Callable, Coroutine
 from typing import Any
@@ -8,14 +9,19 @@ import httpx
 import pytest
 from pydantic import ValidationError
 
-from app.ai.errors import InvalidStructuredOutput, ModelNotInstalled, OllamaPolicyViolation
+from app.ai.errors import (
+    InvalidStructuredOutput,
+    ModelNotInstalled,
+    ModelRequestTimeout,
+    OllamaPolicyViolation,
+)
 from app.ai.models.ollama import OllamaModelAdapter, create_ollama_adapter
 from app.ai.models.ollama_http import OllamaSettings
 from app.ai.models.ollama_wire import OllamaEmbedResponse
 from app.ai.models.profiles import load_model_profile
 from app.ai.schemas import (
     Capability,
-    ChatGenerationRequest,
+    ConversationGenerationRequest,
     ConversationMessage,
     EmbeddingRequest,
     ModelStatus,
@@ -197,8 +203,8 @@ async def test_structured_text_generation_is_local_non_streaming_and_measured() 
     assert result.metrics.client_elapsed_ms >= 0
 
 
-async def test_plain_chat_preserves_ordered_history_without_structured_format() -> None:
-    """Send prior user and assistant turns to the approved local text model."""
+async def test_conversation_generation_preserves_ordered_turns_without_json_format() -> None:
+    """Send ordinary text chat to local Ollama without structured-output constraints."""
 
     payloads: list[dict[str, Any]] = []
 
@@ -207,33 +213,219 @@ async def test_plain_chat_preserves_ordered_history_without_structured_format() 
             return httpx.Response(200, json=tags_response("qwen3:4b"))
         payload = json.loads(request.content)
         payloads.append(payload)
-        return httpx.Response(200, json=chat_response(payload["model"], "Current reply"))
+        return httpx.Response(200, json=chat_response(payload["model"], "V-17 is remembered."))
 
     profile = load_model_profile()
     adapter = adapter_for(handler)
-    result = await adapter.generate_chat(
-        ChatGenerationRequest(
+    result = await adapter.generate_conversation(
+        ConversationGenerationRequest(
             model="qwen3:4b",
+            system_prompt="Respond locally.",
             messages=(
-                ConversationMessage(role="user", content="First question"),
-                ConversationMessage(role="assistant", content="First reply"),
-                ConversationMessage(role="user", content="Follow-up"),
+                ConversationMessage(role="user", content="Remember V-17."),
+                ConversationMessage(role="assistant", content="I will remember V-17."),
+                ConversationMessage(role="user", content="What did I ask you to remember?"),
             ),
+            limits=profile.text_limits,
+            timeout_seconds=30,
+        )
+    )
+    await adapter.close()
+
+    assert payloads[:1] == [
+        {
+            "model": "qwen3:4b",
+            "messages": [
+                {"role": "system", "content": "Respond locally."},
+                {"role": "user", "content": "Remember V-17."},
+                {"role": "assistant", "content": "I will remember V-17."},
+                {"role": "user", "content": "What did I ask you to remember?"},
+            ],
+            "stream": False,
+            "think": False,
+            "keep_alive": "5m",
+            "options": {
+                "temperature": 0.2,
+                "num_ctx": profile.text_limits.context_window,
+                "num_predict": profile.text_limits.max_output_tokens,
+            },
+        }
+    ]
+    assert payloads[1] == {
+        "model": "qwen3:4b",
+        "messages": [],
+        "stream": False,
+        "keep_alive": 0,
+    }
+    assert result.text == "V-17 is remembered."
+    assert result.model == "qwen3:4b"
+    assert result.used_fallback is False
+
+
+async def test_conversation_generation_uses_the_text_fallback_once() -> None:
+    """Keep normal chat on the same approved local fallback policy as other text work."""
+
+    generated_models: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json=tags_response("qwen3:1.7b"))
+        payload = json.loads(request.content)
+        if payload.get("keep_alive") == 0:
+            return httpx.Response(200, json={"done": True})
+        generated_models.append(payload["model"])
+        return httpx.Response(200, json=chat_response(payload["model"], "Local fallback reply."))
+
+    profile = load_model_profile()
+    adapter = adapter_for(handler)
+    result = await adapter.generate_conversation(
+        ConversationGenerationRequest(
+            model="qwen3:4b",
+            system_prompt="Respond locally.",
+            messages=(ConversationMessage(role="user", content="Hello."),),
             limits=profile.text_limits,
         )
     )
     await adapter.close()
 
-    assert payloads[0]["messages"] == [
-        {"role": "user", "content": "First question"},
-        {"role": "assistant", "content": "First reply"},
-        {"role": "user", "content": "Follow-up"},
-    ]
-    assert "format" not in payloads[0]
-    assert payloads[0]["stream"] is False
-    assert payloads[0]["think"] is False
-    assert result.text == "Current reply"
-    assert result.metrics.eval_count == 6
+    assert generated_models == ["qwen3:1.7b"]
+    assert result.model == "qwen3:1.7b"
+    assert result.used_fallback is True
+    assert "not installed" in (result.fallback_reason or "")
+
+
+async def test_conversation_fallback_uses_only_the_remaining_caller_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Do not reset a 30-second caller deadline when the preferred model exhausts time."""
+
+    inference_timeouts: list[float] = []
+    timestamps = iter((0.0, 0.0, 0.0, 10.0, 10.0, 10.0, 11.0))
+    monkeypatch.setattr("app.ai.models.ollama.perf_counter", lambda: next(timestamps))
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json=tags_response("qwen3:4b", "qwen3:1.7b"))
+        payload = json.loads(request.content)
+        if payload.get("keep_alive") == 0:
+            return httpx.Response(200, json={"done": True})
+        inference_timeouts.append(request.extensions["timeout"]["read"])
+        if payload["model"] == "qwen3:4b":
+            return httpx.Response(500, json={"error": "CUDA out of memory"})
+        return httpx.Response(200, json=chat_response(payload["model"], "Fallback reply."))
+
+    profile = load_model_profile()
+    adapter = adapter_for(handler)
+    result = await adapter.generate_conversation(
+        ConversationGenerationRequest(
+            model="qwen3:4b",
+            system_prompt="Respond locally.",
+            messages=(ConversationMessage(role="user", content="Hello."),),
+            limits=profile.text_limits,
+            timeout_seconds=30,
+        )
+    )
+    await adapter.close()
+
+    assert result.model == "qwen3:1.7b"
+    assert inference_timeouts == [30, 20]
+
+
+async def test_conversation_deadline_includes_waiting_for_the_inference_lock() -> None:
+    """Reject a queued request at its deadline before it can start model inference."""
+
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=tags_response("qwen3:4b"))
+
+    profile = load_model_profile()
+    adapter = adapter_for(handler)
+    await adapter._inference_lock.acquire()
+    task = asyncio.create_task(
+        adapter.generate_conversation(
+            ConversationGenerationRequest(
+                model="qwen3:4b",
+                system_prompt="Respond locally.",
+                messages=(ConversationMessage(role="user", content="Hello."),),
+                limits=profile.text_limits,
+                timeout_seconds=0.01,
+            )
+        )
+    )
+    try:
+        await asyncio.sleep(0.05)
+        with pytest.raises(ModelRequestTimeout):
+            await task
+    finally:
+        adapter._inference_lock.release()
+        await adapter.close()
+
+    assert requests == []
+
+
+async def test_conversation_generation_rejects_invalid_assistant_output() -> None:
+    """Do not pass incomplete or empty free-text responses to the backend."""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json=tags_response("qwen3:4b"))
+        payload = json.loads(request.content)
+        if payload.get("keep_alive") == 0:
+            return httpx.Response(200, json={"done": True})
+        return httpx.Response(
+            200,
+            json={
+                **chat_response(payload["model"], " "),
+                "message": {"role": "user", "content": " "},
+            },
+        )
+
+    profile = load_model_profile()
+    adapter = adapter_for(handler)
+    with pytest.raises(InvalidStructuredOutput, match="assistant conversation message"):
+        await adapter.generate_conversation(
+            ConversationGenerationRequest(
+                model="qwen3:4b",
+                system_prompt="Respond locally.",
+                messages=(ConversationMessage(role="user", content="Hello."),),
+                limits=profile.text_limits,
+            )
+        )
+    await adapter.close()
+
+
+async def test_conversation_timeout_uses_the_caller_deadline() -> None:
+    """Permit a shorter backend deadline without exceeding the profile maximum."""
+
+    observed_timeout: float | None = None
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal observed_timeout
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json=tags_response("qwen3:4b"))
+        payload = json.loads(request.content)
+        if payload.get("keep_alive") == 0:
+            return httpx.Response(200, json={"done": True})
+        observed_timeout = request.extensions["timeout"]["read"]
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    profile = load_model_profile()
+    adapter = adapter_for(handler)
+    with pytest.raises(ModelRequestTimeout):
+        await adapter.generate_conversation(
+            ConversationGenerationRequest(
+                model="qwen3:4b",
+                system_prompt="Respond locally.",
+                messages=(ConversationMessage(role="user", content="Hello."),),
+                limits=profile.text_limits,
+                timeout_seconds=30,
+            )
+        )
+    await adapter.close()
+
+    assert observed_timeout == pytest.approx(30, abs=0.1)
 
 
 async def test_embedding_generation_uses_local_embed_endpoint() -> None:

@@ -28,13 +28,24 @@ class OllamaGenerationOptions(OllamaRequestModel):
 
 
 class OllamaChatRequest(OllamaRequestModel):
-    """Validated non-streaming request for local chat generation."""
+    """Validated non-streaming request for structured local generation."""
 
     model: str = Field(min_length=1)
     messages: tuple[OllamaChatMessage, ...] = Field(min_length=1)
     stream: Literal[False] = False
     think: Literal[False] = False
-    format: dict[str, JsonValue] | None = None
+    format: dict[str, JsonValue]
+    keep_alive: str | int
+    options: OllamaGenerationOptions
+
+
+class OllamaConversationRequest(OllamaRequestModel):
+    """Validated non-streaming request for an ordinary local text conversation."""
+
+    model: str = Field(min_length=1)
+    messages: tuple[OllamaChatMessage, ...] = Field(min_length=1)
+    stream: Literal[False] = False
+    think: Literal[False] = False
     keep_alive: str | int
     options: OllamaGenerationOptions
 

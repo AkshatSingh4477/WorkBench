@@ -9,9 +9,9 @@ from uuid import uuid4
 from fastapi import FastAPI
 from pwdlib import PasswordHash
 
-from app.ai.errors import ModelNotInstalled, ModelRequestCancelled, ModelRequestTimeout
+from app.ai.errors import AIError, ModelNotInstalled, ModelRequestTimeout
 from app.ai.fakes import FakeAIEngine
-from app.ai.schemas import ConversationResult, InferenceMetrics
+from app.ai.schemas import ConversationReply, ConversationRequest, InferenceMetrics
 from app.auth.provisioning import provision_initial_employee
 from app.config import ApplicationSettings
 from app.health import ApplicationDependencies
@@ -38,6 +38,47 @@ class RecordingWorkflowRunner:
 
     async def run(self, admission: WorkflowRunAdmission) -> None:
         self.admissions.append(admission)
+
+
+class RecordingConversationAI(FakeAIEngine):
+    """Record bounded conversation requests and make overlap observable."""
+
+    def __init__(
+        self,
+        *,
+        reply_text: str = "Local Qwen reply.",
+        failure: AIError | None = None,
+        delay_seconds: float = 0,
+    ) -> None:
+        super().__init__()
+        self.reply_text = reply_text
+        self.failure = failure
+        self.delay_seconds = delay_seconds
+        self.conversation_requests: list[ConversationRequest] = []
+        self.active_calls = 0
+        self.max_active_calls = 0
+
+    async def reply_to_conversation(self, request: ConversationRequest) -> ConversationReply:
+        self.conversation_requests.append(request)
+        self.active_calls += 1
+        self.max_active_calls = max(self.max_active_calls, self.active_calls)
+        try:
+            if self.delay_seconds:
+                await asyncio.sleep(self.delay_seconds)
+            if self.failure is not None:
+                raise self.failure
+            return ConversationReply(
+                session_id=request.session_id,
+                assistant_text=self.reply_text,
+                model="qwen3:4b",
+                metrics=InferenceMetrics(
+                    client_elapsed_ms=1250,
+                    prompt_eval_count=12,
+                    eval_count=7,
+                ),
+            )
+        finally:
+            self.active_calls -= 1
 
 
 def _frame(
@@ -378,7 +419,7 @@ async def test_create_list_and_append_chat_messages(tmp_path: Path) -> None:
                 app,
                 _frame("messages", "GET", f"/chat/sessions/{session_id}/messages", cookie=cookie),
             )
-    )
+        )
         sessions = json.loads(
             await _dispatch(app, _frame("sessions", "GET", "/chat/sessions", cookie=cookie))
         )
@@ -701,18 +742,7 @@ async def test_session_creation_survives_an_unavailable_audit_writer(tmp_path: P
 async def test_plain_conversation_is_bounded_persisted_and_skips_workflows(
     tmp_path: Path,
 ) -> None:
-    ai = FakeAIEngine(
-        conversation_result=ConversationResult(
-            text="Local Qwen reply.",
-            model="qwen3:4b",
-            metrics=InferenceMetrics(
-                client_elapsed_ms=1250,
-                prompt_eval_count=12,
-                eval_count=7,
-            ),
-        ),
-        chat_history_limit=2,
-    )
+    ai = RecordingConversationAI()
     runner = RecordingWorkflowRunner()
     app, cookie, _ = await _build_app_with_two_employees(
         tmp_path, ai_engine=ai, workflow_runner=runner
@@ -763,9 +793,10 @@ async def test_plain_conversation_is_bounded_persisted_and_skips_workflows(
     metrics = second_payload["metrics"]
     assert isinstance(metrics, dict)
     assert metrics["promptEvalCount"] == 12
-    assert [(item.role, item.content) for item in ai.conversation_requests[1].messages] == [
+    assert ai.conversation_requests[1].user_message == "Follow-up question"
+    assert [(item.role, item.content) for item in ai.conversation_requests[1].history] == [
+        ("user", "First question"),
         ("assistant", "Local Qwen reply."),
-        ("user", "Follow-up question"),
     ]
     messages = _payload(listed)["messages"]
     assert isinstance(messages, list)
@@ -782,10 +813,8 @@ async def test_plain_conversation_is_bounded_persisted_and_skips_workflows(
 async def test_plain_conversation_rejects_foreign_session_before_ai_or_write(
     tmp_path: Path,
 ) -> None:
-    ai = FakeAIEngine()
-    app, owner_cookie, foreign_cookie = await _build_app_with_two_employees(
-        tmp_path, ai_engine=ai
-    )
+    ai = RecordingConversationAI()
+    app, owner_cookie, foreign_cookie = await _build_app_with_two_employees(tmp_path, ai_engine=ai)
     async with app.router.lifespan_context(app):
         session_id = await _create_session(app, owner_cookie)
         response = json.loads(
@@ -824,12 +853,11 @@ async def test_plain_conversation_maps_known_ai_failures_without_assistant_persi
     cases = (
         (ModelNotInstalled("missing"), 503, "text_model_unavailable"),
         (ModelRequestTimeout("slow"), 504, "generation_timeout"),
-        (ModelRequestCancelled("cancelled"), 408, "generation_cancelled"),
     )
     for index, (failure, expected_status, expected_code) in enumerate(cases):
         case_root = tmp_path / str(index)
         app, cookie, _ = await _build_app_with_two_employees(
-            case_root, ai_engine=FakeAIEngine(failures={"chat": failure})
+            case_root, ai_engine=RecordingConversationAI(failure=failure)
         )
         async with app.router.lifespan_context(app):
             session_id = await _create_session(app, cookie)
@@ -864,3 +892,56 @@ async def test_plain_conversation_maps_known_ai_failures_without_assistant_persi
         assert all(isinstance(message, dict) for message in messages)
         assert len(messages) == 1
         assert messages[0]["role"] == "user"
+
+
+async def test_concurrent_conversation_turns_are_serialized_per_session(
+    tmp_path: Path,
+) -> None:
+    ai = RecordingConversationAI(delay_seconds=0.05)
+    app, cookie, _ = await _build_app_with_two_employees(tmp_path, ai_engine=ai)
+    async with app.router.lifespan_context(app):
+        session_id = await _create_session(app, cookie)
+        responses = await asyncio.gather(
+            *(
+                _dispatch(
+                    app,
+                    _frame(
+                        f"concurrent-conversation-{index}",
+                        "POST",
+                        f"/chat/sessions/{session_id}/conversation",
+                        cookie=cookie,
+                        body={"message": message},
+                    ),
+                )
+                for index, message in enumerate(("Question A", "Question B"))
+            )
+        )
+        listed = json.loads(
+            await _dispatch(
+                app,
+                _frame(
+                    "concurrent-conversation-list",
+                    "GET",
+                    f"/chat/sessions/{session_id}/messages",
+                    cookie=cookie,
+                ),
+            )
+        )
+
+    assert [json.loads(response)["status"] for response in responses] == [200, 200]
+    assert ai.max_active_calls == 1
+    assert len(ai.conversation_requests) == 2
+    first_request, second_request = ai.conversation_requests
+    assert first_request.history == ()
+    assert [(item.role, item.content) for item in second_request.history] == [
+        ("user", first_request.user_message),
+        ("assistant", "Local Qwen reply."),
+    ]
+    messages = _payload(listed)["messages"]
+    assert isinstance(messages, list)
+    assert [message["role"] for message in messages] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
