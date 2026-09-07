@@ -201,6 +201,73 @@ async def test_inspection_runner_persists_outputs_events_and_stops_before_export
 
 
 @pytest.mark.asyncio
+async def test_recovery_after_completion_reuses_its_existing_completion_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash before approval preparation cannot duplicate an SSE completion."""
+
+    workflows, drafts, approvals, events, files, admission = await _admit(
+        tmp_path,
+        WorkflowType.INSPECTION_ANALYSIS,
+        file_name="report.pdf",
+        mime_type="application/pdf",
+        content=b"%PDF-1.7\nlocal report",
+    )
+    runner = CheckpointAwareWorkflowRunner(
+        workflows=workflows,
+        drafts=drafts,
+        approvals=approvals,
+        ai_engine=FakeAIEngine(),
+        tool_registry=ToolRegistry(cast(Any, approvals), cast(Any, object()), cast(Any, object())),
+        input_policy=LocalInspectionWorkflowInputPolicy(files),
+        events=events,
+    )
+    original_prepare = workflows.prepare_pending_approval
+
+    async def cancel_before_approval(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(workflows, "prepare_pending_approval", cancel_before_approval)
+    with pytest.raises(asyncio.CancelledError):
+        await runner.run(admission)
+
+    interrupted = await workflows.get_run(
+        workflow_run_id=admission.run.workflow_run_id,
+        session_id=admission.run.session_id,
+        owner_user_id=admission.run.owner_user_id,
+    )
+    assert interrupted is not None and interrupted.retryable
+    monkeypatch.setattr(workflows, "prepare_pending_approval", original_prepare)
+    claimed = await workflows.claim_retry(
+        workflow_run_id=interrupted.workflow_run_id,
+        expected_stage_version=interrupted.stage_version,
+        lease_expires_at=datetime.now(UTC) + timedelta(minutes=2),
+    )
+    assert claimed is not None
+    recovered = await workflows.get_admission(workflow_run_id=claimed.workflow_run_id)
+    assert recovered is not None
+
+    await runner.run(recovered)
+
+    messages = await workflows.list_messages(
+        admission.run.session_id, admission.run.owner_user_id
+    )
+    assistant_messages = [message for message in messages if message.role == "assistant"]
+    completed = [
+        event
+        for event in await events.replay(
+            session_id=admission.run.session_id,
+            owner_user_id=admission.run.owner_user_id,
+            after_event_id=0,
+        )
+        if event.event_type is ActivityEventType.MESSAGE_COMPLETED
+    ]
+    assert len(assistant_messages) == len(completed) == 1
+    assert completed[0].payload["messageId"] == str(assistant_messages[0].message_id)
+
+
+@pytest.mark.asyncio
 async def test_code_repair_creates_only_a_pending_sandbox_approval(tmp_path: Path) -> None:
     workflows, drafts, approvals, events, files, admission = await _admit(
         tmp_path,
