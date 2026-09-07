@@ -2,18 +2,31 @@
 
 from contextlib import suppress
 from datetime import UTC, datetime
-from typing import Annotated, cast
-from uuid import UUID, uuid4
+from typing import Annotated, Literal, cast
+from uuid import UUID, uuid4, uuid5
 
 from fastapi import APIRouter, Path, Request
 from fastapi.responses import JSONResponse
 
+from app.ai.engine import AIEngine
+from app.ai.errors import (
+    InvalidStructuredOutput,
+    ModelCapacityError,
+    ModelNotInstalled,
+    ModelRequestCancelled,
+    ModelRequestFailed,
+    ModelRequestTimeout,
+    ModelRuntimeUnavailable,
+)
+from app.ai.schemas import ConversationMessage, ConversationRequest
 from app.api.auth import AllowedOrigin, CurrentEmployee
 from app.api.chat_contracts import (
     ChatMessageAppendRequest,
     ChatMessageListEnvelope,
     ChatSessionCreateRequest,
     ChatSessionListEnvelope,
+    ConversationCreateRequest,
+    ConversationCreateResponse,
 )
 from app.api.contracts import ErrorResponse
 from app.auth.contracts import AuthenticatedUser
@@ -59,6 +72,13 @@ _READ_ERROR_RESPONSES: dict[int | str, dict[str, object]] = {
 _APPEND_ERROR_RESPONSES: dict[int | str, dict[str, object]] = {
     **_READ_ERROR_RESPONSES,
     409: {"model": ErrorResponse, "description": "The chat session no longer accepts messages"},
+}
+_CONVERSATION_ERROR_RESPONSES: dict[int | str, dict[str, object]] = {
+    **_READ_ERROR_RESPONSES,
+    408: {"model": ErrorResponse, "description": "Local generation was cancelled"},
+    409: {"model": ErrorResponse, "description": "The chat session no longer accepts messages"},
+    502: {"model": ErrorResponse, "description": "Invalid local AI response"},
+    504: {"model": ErrorResponse, "description": "Local generation timed out"},
 }
 
 SessionId = Annotated[UUID, Path(description="Owned chat session identifier")]
@@ -199,6 +219,124 @@ def build_chat_router() -> APIRouter:
             return _error(*_UNAVAILABLE, 503)
         return ChatMessageListEnvelope(
             messages=await store.list_messages(session.session_id, user.user_id)
+        )
+
+    @router.post(
+        "/sessions/{session_id}/conversation",
+        response_model=ConversationCreateResponse,
+        responses=_CONVERSATION_ERROR_RESPONSES,
+    )
+    async def create_conversation_turn(
+        session_id: SessionId,
+        payload: ConversationCreateRequest,
+        _: AllowedOrigin,
+        user: CurrentEmployee,
+        request: Request,
+    ) -> ConversationCreateResponse | JSONResponse:
+        """Generate and persist one local text reply without workflow admission."""
+
+        content = payload.message.strip()
+        if not content:
+            return _error("invalid_message", "The message must not be blank.", 422)
+        session = await _owned_session(session_id, user, request)
+        if isinstance(session, JSONResponse):
+            return session
+        if session.status is not WorkflowStatus.ACTIVE:
+            return _error(
+                "session_not_active",
+                "This chat session is closed and no longer accepts messages.",
+                409,
+            )
+        store = _chat_store(request)
+        engine = cast(AIEngine | None, getattr(request.app.state, "ai_engine", None))
+        if store is None:
+            return _error(*_UNAVAILABLE, 503)
+        if engine is None:
+            return _error(
+                "text_model_unavailable",
+                "The local text model is unavailable.",
+                503,
+            )
+
+        user_message = await store.append_message(
+            WorkflowMessage(
+                message_id=uuid4(),
+                session_id=session.session_id,
+                author_user_id=user.user_id,
+                role="user",
+                content=content,
+                created_at=datetime.now(UTC),
+                client_message_id=payload.client_request_id or uuid4(),
+            )
+        )
+        history = await store.list_messages(
+            session.session_id,
+            user.user_id,
+            limit=engine.chat_history_limit,
+        )
+        try:
+            result = await engine.chat(
+                ConversationRequest(
+                    messages=tuple(
+                        ConversationMessage(
+                            role=cast(Literal["user", "assistant"], message.role),
+                            content=message.content,
+                        )
+                        for message in history
+                    )
+                )
+            )
+        except (ModelNotInstalled, ModelCapacityError):
+            return _error(
+                "text_model_unavailable",
+                "The local text model is unavailable.",
+                503,
+            )
+        except ModelRuntimeUnavailable:
+            return _error(
+                "ollama_unavailable",
+                "The local Ollama service is unavailable.",
+                503,
+            )
+        except ModelRequestTimeout:
+            return _error(
+                "generation_timeout",
+                "The local text generation request timed out.",
+                504,
+            )
+        except ModelRequestCancelled:
+            return _error(
+                "generation_cancelled",
+                "The local text generation request was cancelled.",
+                408,
+            )
+        except (InvalidStructuredOutput, ModelRequestFailed, ValueError):
+            return _error(
+                "invalid_ai_response",
+                "The local text model returned an invalid response.",
+                502,
+            )
+
+        assistant_message_id = uuid5(user_message.message_id, "assistant-reply")
+        assistant_message = await store.append_message(
+            WorkflowMessage(
+                message_id=assistant_message_id,
+                session_id=session.session_id,
+                role="assistant",
+                content=result.text,
+                created_at=datetime.now(UTC),
+                client_message_id=assistant_message_id,
+            )
+        )
+        return ConversationCreateResponse(
+            session_id=session.session_id,
+            user_message_id=user_message.message_id,
+            assistant_message_id=assistant_message.message_id,
+            assistant_text=assistant_message.content,
+            selected_model=result.model,
+            used_fallback=result.used_fallback,
+            fallback_reason=result.fallback_reason,
+            metrics=result.metrics,
         )
 
     @router.post(

@@ -23,9 +23,12 @@ from app.ai.schemas import (
     AgentContext,
     AgentProposal,
     ApprovedKnowledgeRoot,
+    ChatGenerationRequest,
     CodeRepairContent,
     CodeRepairRequest,
     ConversationMessage,
+    ConversationRequest,
+    ConversationResult,
     DraftRequest,
     EmbeddingRequest,
     EmbeddingResult,
@@ -109,6 +112,14 @@ class RecordingModelAdapter:
             model=request.model,
             text=json.dumps(output),
             structured_output=output,
+            metrics=sample_inference_metrics(),
+        )
+
+    async def generate_chat(self, request: ChatGenerationRequest) -> ConversationResult:
+        self.calls.append(f"generate_chat:{len(request.messages)}")
+        return ConversationResult(
+            text="Local conversation reply.",
+            model=request.model,
             metrics=sample_inference_metrics(),
         )
 
@@ -197,6 +208,11 @@ async def test_local_engine_exposes_every_ai_operation_through_one_interface(
     interface = accepts_ai_engine(engine)
 
     health = await interface.health()
+    conversation = await interface.chat(
+        ConversationRequest(
+            messages=(ConversationMessage(role="user", content="Hello Qwen."),)
+        )
+    )
     decision = await interface.choose_capability(sample_task())
     context = AgentContext(
         task=sample_task(),
@@ -264,6 +280,8 @@ async def test_local_engine_exposes_every_ai_operation_through_one_interface(
     )
 
     assert health.runtime_ready is True
+    assert conversation.text == "Local conversation reply."
+    assert interface.chat_history_limit == profile.chat_history_messages
     assert health.knowledge_ready is True
     assert decision.selected_model == "qwen3-vl:4b"
     assert plan == sample_task_plan()

@@ -330,6 +330,7 @@ def create_app(
         audit_store=resolved_dependencies.audit_store,
     )
     application.state.chat_store = resolved_dependencies.chat_store
+    application.state.ai_engine = resolved_dependencies.ai_engine
     application.state.workflow_store = resolved_dependencies.workflow_store
     application.state.session_file_store = resolved_dependencies.session_file_store
     application.state.activity_event_store = resolved_dependencies.activity_event_store

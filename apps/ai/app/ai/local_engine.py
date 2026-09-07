@@ -21,8 +21,11 @@ from app.ai.schemas import (
     AIHealthReport,
     ApprovedKnowledgeRoot,
     CapabilityDecision,
+    ChatGenerationRequest,
     CodeRepairRequest,
     CodeRepairResult,
+    ConversationRequest,
+    ConversationResult,
     DraftRequest,
     EvidenceChunk,
     GroundedDraft,
@@ -88,6 +91,26 @@ class LocalAIEngine:
             models=runtime.models,
             knowledge_ready=knowledge_ready,
             knowledge_error=knowledge_error,
+        )
+
+    @property
+    def chat_history_limit(self) -> int:
+        """Expose the profile-owned bound used by API persistence queries."""
+
+        return self._dependencies.model_profile.chat_history_messages
+
+    async def chat(self, request: ConversationRequest) -> ConversationResult:
+        """Generate a plain local text reply without entering a workflow."""
+
+        profile = self._dependencies.model_profile
+        if len(request.messages) > profile.chat_history_messages:
+            raise ValueError("conversation history exceeds the configured limit")
+        return await self._dependencies.model_adapter.generate_chat(
+            ChatGenerationRequest(
+                model=profile.text_candidates[0],
+                messages=request.messages,
+                limits=profile.text_limits,
+            )
         )
 
     async def choose_capability(self, task: TaskDescriptor) -> CapabilityDecision:

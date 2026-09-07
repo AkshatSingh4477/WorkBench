@@ -456,7 +456,9 @@ class ChatStore(Protocol):
         """Return one owned session or raise when it is missing or foreign."""
         ...
 
-    async def list_messages(self, session_id: UUID, owner_user_id: UUID) -> list[WorkflowMessage]:
+    async def list_messages(
+        self, session_id: UUID, owner_user_id: UUID, *, limit: int | None = None
+    ) -> list[WorkflowMessage]:
         """Return the latest owned messages in chronological order."""
         ...
 

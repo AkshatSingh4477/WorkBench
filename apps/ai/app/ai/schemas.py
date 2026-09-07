@@ -125,6 +125,7 @@ class ModelProfile(ContractModel):
     text_limits: GenerationLimits
     vision_limits: GenerationLimits
     embedding_batch_size: int = Field(gt=0)
+    chat_history_messages: int = Field(default=24, ge=1, le=200)
 
     @model_validator(mode="after")
     def reject_duplicate_candidates(self) -> ModelProfile:
@@ -529,8 +530,24 @@ class DraftRequest(ContractModel):
 class ConversationMessage(ContractModel):
     """A concise conversation item passed to planning, without hidden reasoning."""
 
-    role: str = Field(pattern="^(user|assistant)$")
+    role: Literal["user", "assistant"]
     content: str = Field(min_length=1)
+
+
+class ConversationRequest(ContractModel):
+    """Bounded ordered chat history supplied by the authenticated API layer."""
+
+    messages: tuple[ConversationMessage, ...] = Field(min_length=1, max_length=200)
+
+
+class ConversationResult(ContractModel):
+    """One complete local text-chat response and content-free inference facts."""
+
+    text: str = Field(min_length=1, max_length=20_000)
+    model: str = Field(min_length=1)
+    metrics: InferenceMetrics
+    used_fallback: bool = False
+    fallback_reason: str | None = None
 
 
 class PlanStep(ContractModel):
@@ -629,6 +646,15 @@ class TextGenerationRequest(ContractModel):
     output_schema: dict[str, JsonValue]
     limits: GenerationLimits
     temperature: float = Field(default=0, ge=0, le=1)
+
+
+class ChatGenerationRequest(ContractModel):
+    """Low-level non-streaming conversation request for a local model adapter."""
+
+    model: str = Field(min_length=1)
+    messages: tuple[ConversationMessage, ...] = Field(min_length=1, max_length=200)
+    limits: GenerationLimits
+    temperature: float = Field(default=0.2, ge=0, le=1)
 
 
 class VisionGenerationRequest(ContractModel):

@@ -9,6 +9,9 @@ from uuid import uuid4
 from fastapi import FastAPI
 from pwdlib import PasswordHash
 
+from app.ai.errors import ModelNotInstalled, ModelRequestCancelled, ModelRequestTimeout
+from app.ai.fakes import FakeAIEngine
+from app.ai.schemas import ConversationResult, InferenceMetrics
 from app.auth.provisioning import provision_initial_employee
 from app.config import ApplicationSettings
 from app.health import ApplicationDependencies
@@ -17,6 +20,7 @@ from app.main import create_app
 from app.ports.local_backend import WorkflowRunAdmission
 from app.storage import (
     LocalSQLiteDatabase,
+    SQLiteAuditStore,
     SQLiteAuthSessionStore,
     SQLiteIdentityStore,
     SQLiteWorkflowStore,
@@ -82,7 +86,12 @@ async def _insert_employee(database_path: Path, username: str) -> None:
         )
 
 
-async def _build_app_with_two_employees(tmp_path: Path) -> tuple[FastAPI, str, str]:
+async def _build_app_with_two_employees(
+    tmp_path: Path,
+    *,
+    ai_engine: FakeAIEngine | None = None,
+    workflow_runner: RecordingWorkflowRunner | None = None,
+) -> tuple[FastAPI, str, str]:
     database_path = tmp_path / "workbench.db"
     await provision_initial_employee(
         database_path=database_path,
@@ -91,13 +100,29 @@ async def _build_app_with_two_employees(tmp_path: Path) -> tuple[FastAPI, str, s
         password=PASSWORD,
     )
     await _insert_employee(database_path, "engineer.two")
-    app = create_app(
-        settings=ApplicationSettings(
-            auth_signing_secret=SECRET,
-            database_path=database_path,
-            local_service_capability=CAPABILITY,
-        )
+    settings = ApplicationSettings(
+        auth_signing_secret=SECRET,
+        database_path=database_path,
+        local_service_capability=CAPABILITY,
     )
+    if ai_engine is None:
+        app = create_app(settings=settings)
+    else:
+        database = LocalSQLiteDatabase(database_path)
+        workflow_store = SQLiteWorkflowStore(database)
+        app = create_app(
+            settings=settings,
+            dependencies=ApplicationDependencies(
+                ai_engine=ai_engine,
+                identity_store=SQLiteIdentityStore(database),
+                auth_session_store=SQLiteAuthSessionStore(database),
+                audit_store=SQLiteAuditStore(database),
+                chat_store=workflow_store,
+                workflow_store=workflow_store,
+                workflow_runner=workflow_runner,
+                startup=database.initialize,
+            ),
+        )
 
     async def login(username: str, request_id: str) -> str:
         response = json.loads(
@@ -353,7 +378,7 @@ async def test_create_list_and_append_chat_messages(tmp_path: Path) -> None:
                 app,
                 _frame("messages", "GET", f"/chat/sessions/{session_id}/messages", cookie=cookie),
             )
-        )
+    )
         sessions = json.loads(
             await _dispatch(app, _frame("sessions", "GET", "/chat/sessions", cookie=cookie))
         )
@@ -461,7 +486,7 @@ async def test_message_admission_requires_a_configured_workflow_runner(tmp_path:
                 app,
                 _frame("messages", "GET", f"/chat/sessions/{session_id}/messages", cookie=cookie),
             )
-    )
+        )
 
     assert response["status"] == 503
     assert _payload(response)["code"] == "chat_store_unavailable"
@@ -671,3 +696,171 @@ async def test_session_creation_survives_an_unavailable_audit_writer(tmp_path: P
     assert _payload(created)["title"] == "Audit down"
     sessions = _payload(listed)["sessions"]
     assert isinstance(sessions, list) and len(sessions) == 1
+
+
+async def test_plain_conversation_is_bounded_persisted_and_skips_workflows(
+    tmp_path: Path,
+) -> None:
+    ai = FakeAIEngine(
+        conversation_result=ConversationResult(
+            text="Local Qwen reply.",
+            model="qwen3:4b",
+            metrics=InferenceMetrics(
+                client_elapsed_ms=1250,
+                prompt_eval_count=12,
+                eval_count=7,
+            ),
+        ),
+        chat_history_limit=2,
+    )
+    runner = RecordingWorkflowRunner()
+    app, cookie, _ = await _build_app_with_two_employees(
+        tmp_path, ai_engine=ai, workflow_runner=runner
+    )
+    async with app.router.lifespan_context(app):
+        session_id = await _create_session(app, cookie)
+        first = json.loads(
+            await _dispatch(
+                app,
+                _frame(
+                    "conversation-one",
+                    "POST",
+                    f"/chat/sessions/{session_id}/conversation",
+                    cookie=cookie,
+                    body={"message": "First question", "clientRequestId": str(uuid4())},
+                ),
+            )
+        )
+        second = json.loads(
+            await _dispatch(
+                app,
+                _frame(
+                    "conversation-two",
+                    "POST",
+                    f"/chat/sessions/{session_id}/conversation",
+                    cookie=cookie,
+                    body={"message": "Follow-up question"},
+                ),
+            )
+        )
+        listed = json.loads(
+            await _dispatch(
+                app,
+                _frame(
+                    "conversation-list",
+                    "GET",
+                    f"/chat/sessions/{session_id}/messages",
+                    cookie=cookie,
+                ),
+            )
+        )
+
+    assert first["status"] == second["status"] == 200
+    second_payload = _payload(second)
+    assert second_payload["assistantText"] == "Local Qwen reply."
+    assert second_payload["selectedModel"] == "qwen3:4b"
+    assert second_payload["usedFallback"] is False
+    metrics = second_payload["metrics"]
+    assert isinstance(metrics, dict)
+    assert metrics["promptEvalCount"] == 12
+    assert [(item.role, item.content) for item in ai.conversation_requests[1].messages] == [
+        ("assistant", "Local Qwen reply."),
+        ("user", "Follow-up question"),
+    ]
+    messages = _payload(listed)["messages"]
+    assert isinstance(messages, list)
+    assert all(isinstance(message, dict) for message in messages)
+    assert [message["role"] for message in messages] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
+    assert runner.admissions == []
+
+
+async def test_plain_conversation_rejects_foreign_session_before_ai_or_write(
+    tmp_path: Path,
+) -> None:
+    ai = FakeAIEngine()
+    app, owner_cookie, foreign_cookie = await _build_app_with_two_employees(
+        tmp_path, ai_engine=ai
+    )
+    async with app.router.lifespan_context(app):
+        session_id = await _create_session(app, owner_cookie)
+        response = json.loads(
+            await _dispatch(
+                app,
+                _frame(
+                    "foreign-conversation",
+                    "POST",
+                    f"/chat/sessions/{session_id}/conversation",
+                    cookie=foreign_cookie,
+                    body={"message": "Read another employee's history"},
+                ),
+            )
+        )
+        listed = json.loads(
+            await _dispatch(
+                app,
+                _frame(
+                    "owner-list",
+                    "GET",
+                    f"/chat/sessions/{session_id}/messages",
+                    cookie=owner_cookie,
+                ),
+            )
+        )
+
+    assert response["status"] == 404
+    assert _payload(response)["code"] == "session_not_found"
+    assert _payload(listed)["messages"] == []
+    assert ai.conversation_requests == []
+
+
+async def test_plain_conversation_maps_known_ai_failures_without_assistant_persistence(
+    tmp_path: Path,
+) -> None:
+    cases = (
+        (ModelNotInstalled("missing"), 503, "text_model_unavailable"),
+        (ModelRequestTimeout("slow"), 504, "generation_timeout"),
+        (ModelRequestCancelled("cancelled"), 408, "generation_cancelled"),
+    )
+    for index, (failure, expected_status, expected_code) in enumerate(cases):
+        case_root = tmp_path / str(index)
+        app, cookie, _ = await _build_app_with_two_employees(
+            case_root, ai_engine=FakeAIEngine(failures={"chat": failure})
+        )
+        async with app.router.lifespan_context(app):
+            session_id = await _create_session(app, cookie)
+            response = json.loads(
+                await _dispatch(
+                    app,
+                    _frame(
+                        f"failed-conversation-{index}",
+                        "POST",
+                        f"/chat/sessions/{session_id}/conversation",
+                        cookie=cookie,
+                        body={"message": "Keep only this user message"},
+                    ),
+                )
+            )
+            listed = json.loads(
+                await _dispatch(
+                    app,
+                    _frame(
+                        f"failed-list-{index}",
+                        "GET",
+                        f"/chat/sessions/{session_id}/messages",
+                        cookie=cookie,
+                    ),
+                )
+            )
+
+        assert response["status"] == expected_status
+        assert _payload(response)["code"] == expected_code
+        messages = _payload(listed)["messages"]
+        assert isinstance(messages, list)
+        assert all(isinstance(message, dict) for message in messages)
+        assert len(messages) == 1
+        assert messages[0]["role"] == "user"

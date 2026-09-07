@@ -38,6 +38,9 @@ from app.ai.models.profiles import load_model_profile
 from app.ai.models.structured_output import validate_output_schema, validate_structured_output
 from app.ai.schemas import (
     Capability,
+    ChatGenerationRequest,
+    ConversationMessage,
+    ConversationResult,
     EmbeddingRequest,
     EmbeddingResult,
     InferenceMetrics,
@@ -148,6 +151,30 @@ class OllamaModelAdapter:
                     user_prompt=request.user_prompt,
                     images_base64=(),
                     output_schema=request.output_schema,
+                    context_window=request.limits.context_window,
+                    max_output_tokens=request.limits.max_output_tokens,
+                    timeout_seconds=request.limits.timeout_seconds,
+                    temperature=request.temperature,
+                ),
+            )
+        return result.model_copy(
+            update={
+                "model": selected_model,
+                "used_fallback": fallback_reason is not None,
+                "fallback_reason": fallback_reason,
+            }
+        )
+
+    async def generate_chat(self, request: ChatGenerationRequest) -> ConversationResult:
+        """Run plain multi-turn text chat with approved-model fallback."""
+
+        async with self._inference_lock:
+            result, selected_model, fallback_reason = await self._with_fallback(
+                Capability.TEXT,
+                request.model,
+                lambda model: self._conversation(
+                    model=model,
+                    messages=request.messages,
                     context_window=request.limits.context_window,
                     max_output_tokens=request.limits.max_output_tokens,
                     timeout_seconds=request.limits.timeout_seconds,
@@ -401,6 +428,61 @@ class OllamaModelAdapter:
             done_reason=result.done_reason,
             metrics=metrics,
         )
+
+    async def _conversation(
+        self,
+        *,
+        model: str,
+        messages: tuple[ConversationMessage, ...],
+        context_window: int,
+        max_output_tokens: int,
+        timeout_seconds: float,
+        temperature: float,
+    ) -> ConversationResult:
+        payload = OllamaChatRequest(
+            model=model,
+            messages=tuple(
+                OllamaChatMessage(role=message.role, content=message.content)
+                for message in messages
+            ),
+            keep_alive=self._settings.keep_alive,
+            options=OllamaGenerationOptions(
+                temperature=temperature,
+                num_ctx=context_window,
+                num_predict=max_output_tokens,
+            ),
+        )
+        started = perf_counter()
+        response = await self._client.request(
+            OllamaEndpoint.CHAT,
+            payload=payload.model_dump(mode="json", exclude_none=True),
+            timeout_seconds=timeout_seconds,
+        )
+        elapsed_ms = (perf_counter() - started) * 1_000
+        self._raise_for_status(response, model=model)
+        try:
+            result = OllamaChatResponse.model_validate_json(response.content)
+        except ValidationError as error:
+            raise InvalidStructuredOutput(
+                "Ollama returned an invalid chat response",
+                model=model,
+                metrics=InferenceMetrics(client_elapsed_ms=elapsed_ms),
+            ) from error
+        metrics = self._chat_metrics(result, elapsed_ms)
+        if result.model != model or result.message.role != "assistant" or not result.done:
+            raise InvalidStructuredOutput(
+                "Ollama returned an invalid chat response",
+                model=model,
+                metrics=metrics,
+            )
+        text = result.message.content.strip()
+        if not text:
+            raise InvalidStructuredOutput(
+                "Ollama returned an empty chat response",
+                model=model,
+                metrics=metrics,
+            )
+        return ConversationResult(model=model, text=text, metrics=metrics)
 
     async def _embed(self, model: str, inputs: tuple[str, ...]) -> EmbeddingResult:
         payload = OllamaEmbedRequest(model=model, input=inputs)

@@ -13,6 +13,8 @@ from app.ai.schemas import (
     CapabilityDecision,
     CodeRepairRequest,
     CodeRepairResult,
+    ConversationRequest,
+    ConversationResult,
     DraftRequest,
     EvidenceChunk,
     GroundedDraft,
@@ -42,6 +44,15 @@ class AIEngine(Protocol):
 
     async def health(self) -> AIHealthReport:
         """Report local model-runtime and knowledge-index readiness."""
+        ...
+
+    @property
+    def chat_history_limit(self) -> int:
+        """Return the configured maximum history passed to local text chat."""
+        ...
+
+    async def chat(self, request: ConversationRequest) -> ConversationResult:
+        """Generate one complete reply from bounded conversation history."""
         ...
 
     async def choose_capability(self, task: TaskDescriptor) -> CapabilityDecision:

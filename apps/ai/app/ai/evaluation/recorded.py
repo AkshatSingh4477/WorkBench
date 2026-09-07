@@ -4,6 +4,8 @@ import json
 
 from app.ai.evaluation.samples import sample_inference_metrics, sample_runtime_health
 from app.ai.schemas import (
+    ChatGenerationRequest,
+    ConversationResult,
     EmbeddingRequest,
     EmbeddingResult,
     Finding,
@@ -177,6 +179,12 @@ class GoldenRecordedModelAdapter:
             uncertainties=(_UNCERTAINTY,),
         )
         return _text_result(request.model, draft)
+
+    async def generate_chat(self, request: ChatGenerationRequest) -> ConversationResult:
+        """Keep golden workflow fixtures separate from endpoint chat behavior."""
+
+        del request
+        raise AssertionError("plain chat is not part of the recorded golden workflow")
 
     async def generate_vision(self, request: VisionGenerationRequest) -> TextGenerationResult:
         metadata = _source_metadata(request.user_prompt)

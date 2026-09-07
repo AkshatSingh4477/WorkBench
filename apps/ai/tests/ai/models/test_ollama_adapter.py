@@ -15,6 +15,8 @@ from app.ai.models.ollama_wire import OllamaEmbedResponse
 from app.ai.models.profiles import load_model_profile
 from app.ai.schemas import (
     Capability,
+    ChatGenerationRequest,
+    ConversationMessage,
     EmbeddingRequest,
     ModelStatus,
     TextGenerationRequest,
@@ -193,6 +195,45 @@ async def test_structured_text_generation_is_local_non_streaming_and_measured() 
     assert result.metrics.prompt_eval_count == 10
     assert result.metrics.eval_count == 6
     assert result.metrics.client_elapsed_ms >= 0
+
+
+async def test_plain_chat_preserves_ordered_history_without_structured_format() -> None:
+    """Send prior user and assistant turns to the approved local text model."""
+
+    payloads: list[dict[str, Any]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json=tags_response("qwen3:4b"))
+        payload = json.loads(request.content)
+        payloads.append(payload)
+        return httpx.Response(200, json=chat_response(payload["model"], "Current reply"))
+
+    profile = load_model_profile()
+    adapter = adapter_for(handler)
+    result = await adapter.generate_chat(
+        ChatGenerationRequest(
+            model="qwen3:4b",
+            messages=(
+                ConversationMessage(role="user", content="First question"),
+                ConversationMessage(role="assistant", content="First reply"),
+                ConversationMessage(role="user", content="Follow-up"),
+            ),
+            limits=profile.text_limits,
+        )
+    )
+    await adapter.close()
+
+    assert payloads[0]["messages"] == [
+        {"role": "user", "content": "First question"},
+        {"role": "assistant", "content": "First reply"},
+        {"role": "user", "content": "Follow-up"},
+    ]
+    assert "format" not in payloads[0]
+    assert payloads[0]["stream"] is False
+    assert payloads[0]["think"] is False
+    assert result.text == "Current reply"
+    assert result.metrics.eval_count == 6
 
 
 async def test_embedding_generation_uses_local_embed_endpoint() -> None:

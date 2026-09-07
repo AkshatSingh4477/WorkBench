@@ -2899,8 +2899,14 @@ class SQLiteWorkflowStore:
             raise WorkflowSessionNotFoundError(f"Workflow session not found: {session_id}")
         return self._workflow_session_from_row(row)
 
-    async def list_messages(self, session_id: UUID, owner_user_id: UUID) -> list[WorkflowMessage]:
+    async def list_messages(
+        self, session_id: UUID, owner_user_id: UUID, *, limit: int | None = None
+    ) -> list[WorkflowMessage]:
         """Return the latest owned messages in durable chronological order."""
+
+        selected_limit = self._MAX_LISTED_MESSAGES if limit is None else limit
+        if selected_limit < 1 or selected_limit > self._MAX_LISTED_MESSAGES:
+            raise ValueError("message list limit is outside the supported bound")
 
         async with self._database.open() as connection:
             cursor = await connection.execute(
@@ -2915,7 +2921,7 @@ class SQLiteWorkflowStore:
                 ORDER BY messages.sequence DESC
                 LIMIT ?
                 """,
-                (str(session_id), str(owner_user_id), self._MAX_LISTED_MESSAGES),
+                (str(session_id), str(owner_user_id), selected_limit),
             )
             rows = list(await cursor.fetchall())
         return [self._message_from_row(row) for row in rows[::-1]]

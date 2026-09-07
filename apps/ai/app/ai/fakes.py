@@ -21,8 +21,11 @@ from app.ai.schemas import (
     AIHealthReport,
     Capability,
     CapabilityDecision,
+    ChatGenerationRequest,
     CodeRepairRequest,
     CodeRepairResult,
+    ConversationRequest,
+    ConversationResult,
     DraftRequest,
     EmbeddingRequest,
     EmbeddingResult,
@@ -45,6 +48,7 @@ from app.ai.schemas import (
 
 type FakeEngineOperation = Literal[
     "health",
+    "chat",
     "choose_capability",
     "plan_task",
     "analyze_visual",
@@ -79,6 +83,16 @@ class FakeModelAdapter:
 
         self.calls.append(f"health:{profile.profile_id}")
         return self.runtime_health
+
+    async def generate_chat(self, request: ChatGenerationRequest) -> ConversationResult:
+        """Return a deterministic local-chat reply and record the bounded request."""
+
+        self.calls.append(f"generate_chat:{len(request.messages)}")
+        return ConversationResult(
+            text="Deterministic fake chat reply.",
+            model=request.model,
+            metrics=sample_inference_metrics(),
+        )
 
     async def generate_text(self, request: TextGenerationRequest) -> TextGenerationResult:
         """Return deterministic structured text."""
@@ -199,8 +213,17 @@ class FakeAIEngine:
     ingestion_result: IngestionResult | None = None
     action_proposal: AgentProposal | None = None
     code_repair_result: CodeRepairResult | None = None
+    conversation_result: ConversationResult = field(
+        default_factory=lambda: ConversationResult(
+            text="Deterministic fake chat reply.",
+            model="qwen3:4b",
+            metrics=sample_inference_metrics(),
+        )
+    )
+    chat_history_limit: int = 24
     failures: dict[FakeEngineOperation, AIError] = field(default_factory=dict)
     calls: list[str] = field(default_factory=list, init=False)
+    conversation_requests: list[ConversationRequest] = field(default_factory=list, init=False)
 
     async def health(self) -> AIHealthReport:
         """Return configured combined health."""
@@ -208,6 +231,14 @@ class FakeAIEngine:
         self.calls.append("health")
         self._raise_configured_failure("health")
         return self.health_report
+
+    async def chat(self, request: ConversationRequest) -> ConversationResult:
+        """Return the configured plain-chat result without workflow behavior."""
+
+        self.calls.append(f"chat:{len(request.messages)}")
+        self.conversation_requests.append(request)
+        self._raise_configured_failure("chat")
+        return self.conversation_result
 
     async def choose_capability(self, task: TaskDescriptor) -> CapabilityDecision:
         """Return a deterministic fake capability selection."""
