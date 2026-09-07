@@ -12,6 +12,7 @@ import type {
   EmployeeSessionRestoreResponse,
   HealthResponse,
   LocalServiceRequest,
+  WorkflowUploadResponse,
 } from "../../shared/contracts";
 import {
   chatErrorCodeSchema,
@@ -20,6 +21,7 @@ import {
   chatSessionListResponseSchema,
   chatSessionSchema,
   healthResponseSchema,
+  workflowUploadResponseSchema,
 } from "../../shared/contracts.ts";
 import type { ZodType } from "zod";
 
@@ -275,6 +277,14 @@ export class LocalApiClient {
       chatMessageSchema,
       await this.requestJson({ operation: "chatAppendMessage", sessionId, request }, "chat message"),
       "chat message",
+    );
+  }
+
+  async uploadWorkflowFile(sessionId: string, uploadToken: string): Promise<WorkflowUploadResponse> {
+    return parseChat(
+      workflowUploadResponseSchema,
+      await this.requestJson({ operation: "workflowUpload", sessionId, uploadToken }, "workflow upload", 120_000),
+      "workflow upload",
     );
   }
 }

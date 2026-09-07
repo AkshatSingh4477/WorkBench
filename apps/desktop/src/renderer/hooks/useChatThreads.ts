@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useReducer, useRef } from "react";
+import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import type { SelectedChatAttachment, SelectedUploadFile, UploadKind } from "../../shared/contracts";
 
 import { LocalApiError, apiFailureWasDefinitive, localApi } from "../api/localApi";
@@ -13,6 +13,8 @@ import {
   type ChatThreadState,
 } from "../lib/chatThreads";
 export type { ChatThread, ChatThreadId } from "../lib/chatThreads";
+
+const eventReconnectDelayMs = 1_000;
 
 export interface ChatThreadsOptions {
   apiBaseUrl: string;
@@ -60,6 +62,9 @@ export function useChatThreads({ apiBaseUrl, connected, examplesEnabled }: ChatT
   // two invocations in the same tick from minting two idempotency keys. This
   // synchronous gate is authoritative for one send body per thread.
   const inFlightSendThreadsRef = useRef(new Set<ChatThreadId>());
+  const eventSubscriptionsRef = useRef(new Map<string, () => void>());
+  const eventReconnectTimersRef = useRef(new Map<string, number>());
+  const [subscriptionVersion, setSubscriptionVersion] = useState(0);
 
   const loadSessions = useCallback(() => {
     const requestSequence = ++sessionsSequenceRef.current;
@@ -113,6 +118,85 @@ export function useChatThreads({ apiBaseUrl, connected, examplesEnabled }: ChatT
       loadThreadMessages(activeThread.id);
     }
   }, [activeThread, connected, loadThreadMessages]);
+
+  useEffect(() => {
+    if (!connected) {
+      for (const unsubscribe of eventSubscriptionsRef.current.values()) unsubscribe();
+      eventSubscriptionsRef.current.clear();
+      for (const timer of eventReconnectTimersRef.current.values()) window.clearTimeout(timer);
+      eventReconnectTimersRef.current.clear();
+      return;
+    }
+    const bound = new Map(
+      state.threads.flatMap((thread) => thread.source === "local" && thread.sessionId && thread.status === "active" ? [[thread.sessionId, thread.id] as const] : []),
+    );
+    for (const [sessionId, unsubscribe] of eventSubscriptionsRef.current) {
+      if (!bound.has(sessionId)) {
+        unsubscribe();
+        eventSubscriptionsRef.current.delete(sessionId);
+      }
+    }
+    for (const [sessionId, timer] of eventReconnectTimersRef.current) {
+      if (!bound.has(sessionId)) {
+        window.clearTimeout(timer);
+        eventReconnectTimersRef.current.delete(sessionId);
+      }
+    }
+    for (const [sessionId, threadId] of bound) {
+      if (eventSubscriptionsRef.current.has(sessionId)) continue;
+      const thread = state.threads.find((candidate) => candidate.id === threadId);
+      const afterEventId = thread?.activityEvents.reduce(
+        (latest, event) => Math.max(latest, event.eventId),
+        0,
+      ) ?? 0;
+      const unsubscribe = window.workbench.subscribeSessionEvents(sessionId, afterEventId, (update) => {
+        if (update.type === "event") {
+          dispatch({ type: "workflowEvent", threadId, event: update.event });
+          if (update.event.eventType === "message.completed" || update.event.eventType === "workflow.failed") {
+            void localApi.listChatMessages(sessionId, apiBaseUrl).then(
+              (response) => dispatch({ type: "messagesLoaded", threadId, messages: response.messages }),
+              () => undefined,
+            );
+            void localApi.getChatSession(sessionId, apiBaseUrl).then(
+              (session) => dispatch({ type: "sessionSynced", threadId, session }),
+              () => undefined,
+            );
+          }
+        } else if (update.type === "connected") {
+          dispatch({ type: "streamConnected", threadId });
+        } else if (update.type === "error" || update.type === "closed") {
+          const currentUnsubscribe = eventSubscriptionsRef.current.get(sessionId);
+          if (currentUnsubscribe === unsubscribe) {
+            currentUnsubscribe();
+            eventSubscriptionsRef.current.delete(sessionId);
+          }
+          dispatch({
+            type: "streamFailed",
+            threadId,
+            message: update.type === "error" ? update.message : "Workflow activity disconnected. Reconnecting…",
+          });
+          if (!eventReconnectTimersRef.current.has(sessionId)) {
+            const timer = window.setTimeout(() => {
+              eventReconnectTimersRef.current.delete(sessionId);
+              const current = stateRef.current.threads.find((candidate) => candidate.id === threadId);
+              if (current?.sessionId === sessionId && current.status === "active") {
+                setSubscriptionVersion((version) => version + 1);
+              }
+            }, eventReconnectDelayMs);
+            eventReconnectTimersRef.current.set(sessionId, timer);
+          }
+        }
+      });
+      eventSubscriptionsRef.current.set(sessionId, unsubscribe);
+    }
+  }, [apiBaseUrl, connected, state.threads, subscriptionVersion]);
+
+  useEffect(() => () => {
+    for (const unsubscribe of eventSubscriptionsRef.current.values()) unsubscribe();
+    eventSubscriptionsRef.current.clear();
+    for (const timer of eventReconnectTimersRef.current.values()) window.clearTimeout(timer);
+    eventReconnectTimersRef.current.clear();
+  }, []);
 
   const selectChat = useCallback(
     (threadId: ChatThreadId) => {
@@ -192,21 +276,26 @@ export function useChatThreads({ apiBaseUrl, connected, examplesEnabled }: ChatT
             dispatch({ type: "sessionBound", threadId, session: created });
             sessionId = created.sessionId;
           }
+          const selectedFiles = [
+            ...Object.values(thread.inspectionFiles).filter((file): file is SelectedUploadFile => file !== undefined),
+            ...thread.attachments,
+          ];
+          const uploadedIdsByToken = { ...thread.uploadedIdsByToken };
+          for (const file of selectedFiles) {
+            if (uploadedIdsByToken[file.uploadToken]) continue;
+            const uploaded = await localApi.uploadWorkflowFile(sessionId, file.uploadToken);
+            uploadedIdsByToken[file.uploadToken] = uploaded.uploadId;
+            dispatch({ type: "uploadRegistered", threadId, uploadToken: file.uploadToken, uploadId: uploaded.uploadId });
+          }
           const message = await localApi.appendChatMessage(
             sessionId,
-            { content, clientMessageId },
+            { content, clientMessageId, selectedUploadIds: selectedFiles.map((file) => uploadedIdsByToken[file.uploadToken]!) },
             apiBaseUrl,
           );
           if (sendSequencesRef.current.get(threadId) !== requestSequence) return;
           dispatch({ type: "messageAppended", threadId, message, now: Date.now() });
+          dispatch({ type: "workflowQueued", threadId });
           dispatch({ type: "draftClearedIfUnchanged", threadId, draft: submittedDraft, now: Date.now() });
-          try {
-            const refreshed = await localApi.getChatSession(sessionId, apiBaseUrl);
-            if (sendSequencesRef.current.get(threadId) !== requestSequence) return;
-            dispatch({ type: "sessionSynced", threadId, session: refreshed });
-          } catch {
-            // The message is stored; a failed stage refresh is visible state lag, not a lost message.
-          }
         } catch (error) {
           if (sendSequencesRef.current.get(threadId) !== requestSequence) return;
           // Release the keys only when the outcome is certain: FastAPI
