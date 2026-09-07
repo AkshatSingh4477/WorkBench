@@ -3,9 +3,11 @@
 import asyncio
 import base64
 import json
+from datetime import UTC, datetime
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
+import pytest
 from fastapi import FastAPI
 from pwdlib import PasswordHash
 
@@ -17,7 +19,7 @@ from app.config import ApplicationSettings
 from app.health import ApplicationDependencies
 from app.ipc_service import _dispatch
 from app.main import create_app
-from app.ports.local_backend import WorkflowRunAdmission
+from app.ports.local_backend import WorkflowMessage, WorkflowRunAdmission
 from app.storage import (
     LocalSQLiteDatabase,
     SQLiteAuditStore,
@@ -49,20 +51,27 @@ class RecordingConversationAI(FakeAIEngine):
         reply_text: str = "Local Qwen reply.",
         failure: AIError | None = None,
         delay_seconds: float = 0,
+        pause_generation: bool = False,
     ) -> None:
         super().__init__()
         self.reply_text = reply_text
         self.failure = failure
         self.delay_seconds = delay_seconds
+        self.pause_generation = pause_generation
         self.conversation_requests: list[ConversationRequest] = []
         self.active_calls = 0
         self.max_active_calls = 0
+        self.generation_started = asyncio.Event()
+        self.release_generation = asyncio.Event()
 
     async def reply_to_conversation(self, request: ConversationRequest) -> ConversationReply:
         self.conversation_requests.append(request)
         self.active_calls += 1
         self.max_active_calls = max(self.max_active_calls, self.active_calls)
         try:
+            self.generation_started.set()
+            if self.pause_generation:
+                await self.release_generation.wait()
             if self.delay_seconds:
                 await asyncio.sleep(self.delay_seconds)
             if self.failure is not None:
@@ -889,9 +898,7 @@ async def test_plain_conversation_maps_known_ai_failures_without_assistant_persi
         assert _payload(response)["code"] == expected_code
         messages = _payload(listed)["messages"]
         assert isinstance(messages, list)
-        assert all(isinstance(message, dict) for message in messages)
-        assert len(messages) == 1
-        assert messages[0]["role"] == "user"
+        assert messages == []
 
 
 async def test_concurrent_conversation_turns_are_serialized_per_session(
@@ -945,3 +952,98 @@ async def test_concurrent_conversation_turns_are_serialized_per_session(
         "user",
         "assistant",
     ]
+
+
+async def test_cross_route_write_rejects_stale_conversation_without_partial_turn(
+    tmp_path: Path,
+) -> None:
+    ai = RecordingConversationAI(pause_generation=True)
+    app, cookie, _ = await _build_app_with_two_employees(tmp_path, ai_engine=ai)
+    async with app.router.lifespan_context(app):
+        session_id = await _create_session(app, cookie)
+        conversation = asyncio.create_task(
+            _dispatch(
+                app,
+                _frame(
+                    "cross-route-conversation",
+                    "POST",
+                    f"/chat/sessions/{session_id}/conversation",
+                    cookie=cookie,
+                    body={"message": "Conversation prompt"},
+                ),
+            )
+        )
+        await ai.generation_started.wait()
+        identity_store = SQLiteIdentityStore(LocalSQLiteDatabase(tmp_path / "workbench.db"))
+        owner = await identity_store.get_by_username("engineer.one")
+        assert owner is not None
+        await app.state.chat_store.append_message(
+            WorkflowMessage(
+                message_id=uuid4(),
+                session_id=UUID(session_id),
+                author_user_id=owner.user_id,
+                role="user",
+                content="Workflow prompt",
+                created_at=datetime.now(UTC),
+                client_message_id=uuid4(),
+            )
+        )
+        ai.release_generation.set()
+        conversation_response = json.loads(await conversation)
+        listed = json.loads(
+            await _dispatch(
+                app,
+                _frame(
+                    "cross-route-list",
+                    "GET",
+                    f"/chat/sessions/{session_id}/messages",
+                    cookie=cookie,
+                ),
+            )
+        )
+
+    assert conversation_response["status"] == 409
+    assert _payload(conversation_response)["code"] == "conversation_conflict"
+    messages = _payload(listed)["messages"]
+    assert isinstance(messages, list)
+    assert [(message["role"], message["content"]) for message in messages] == [
+        ("user", "Workflow prompt")
+    ]
+
+
+async def test_cancelled_conversation_does_not_persist_an_orphaned_prompt(
+    tmp_path: Path,
+) -> None:
+    ai = RecordingConversationAI(pause_generation=True)
+    app, cookie, _ = await _build_app_with_two_employees(tmp_path, ai_engine=ai)
+    async with app.router.lifespan_context(app):
+        session_id = await _create_session(app, cookie)
+        conversation = asyncio.create_task(
+            _dispatch(
+                app,
+                _frame(
+                    "cancelled-conversation",
+                    "POST",
+                    f"/chat/sessions/{session_id}/conversation",
+                    cookie=cookie,
+                    body={"message": "Do not leave this prompt behind"},
+                ),
+            )
+        )
+        await ai.generation_started.wait()
+        conversation.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await conversation
+        listed = json.loads(
+            await _dispatch(
+                app,
+                _frame(
+                    "cancelled-conversation-list",
+                    "GET",
+                    f"/chat/sessions/{session_id}/messages",
+                    cookie=cookie,
+                ),
+            )
+        )
+
+    assert _payload(listed)["messages"] == []

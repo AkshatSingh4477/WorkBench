@@ -448,6 +448,16 @@ class ChatStore(Protocol):
         """
         ...
 
+    async def append_conversation_turn(
+        self,
+        *,
+        user_message: WorkflowMessage,
+        assistant_message: WorkflowMessage,
+        expected_latest_message_id: UUID | None,
+    ) -> tuple[WorkflowMessage, WorkflowMessage]:
+        """Atomically append a complete turn if its history snapshot is still current."""
+        ...
+
     async def list_sessions(self, owner_user_id: UUID) -> list[WorkflowSession]:
         """Return the owner's sessions, most recently updated first."""
         ...

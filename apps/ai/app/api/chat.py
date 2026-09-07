@@ -48,7 +48,11 @@ from app.ports.local_backend import (
     WorkflowRunAdmissionRequest,
     WorkflowStore,
 )
-from app.storage import SessionAlreadyExistsError, WorkflowSessionNotFoundError
+from app.storage import (
+    ConversationTurnConflictError,
+    SessionAlreadyExistsError,
+    WorkflowSessionNotFoundError,
+)
 from app.storage.sqlite import WorkflowAdmissionConflictError
 from app.workflow.contracts import (
     WorkflowRun,
@@ -119,20 +123,21 @@ class _ConversationTurnLocks:
                     self._locks[session_id] = (current_lock, current_users - 1)
 
 
-def _completed_history(messages: list[WorkflowMessage]) -> tuple[ConversationMessage, ...]:
-    """Return only completed adjacent user/assistant pairs within the AI bound."""
+class _ConversationHistoryConflict(RuntimeError):
+    """Stored messages do not form complete user/assistant turns."""
 
-    completed: list[ConversationMessage] = []
-    pending_user: ConversationMessage | None = None
-    for message in messages:
-        if message.role == "user":
-            pending_user = ConversationMessage(role="user", content=message.content)
-        elif pending_user is not None:
-            completed.extend(
-                (pending_user, ConversationMessage(role="assistant", content=message.content))
-            )
-            pending_user = None
-    return tuple(completed[-MAX_CONVERSATION_HISTORY_MESSAGES:])
+
+def _completed_history(messages: list[WorkflowMessage]) -> tuple[ConversationMessage, ...]:
+    """Return complete ordered pairs, rejecting an in-progress cross-route turn."""
+
+    if len(messages) % 2 != 0 or any(
+        message.role != ("user" if index % 2 == 0 else "assistant")
+        for index, message in enumerate(messages)
+    ):
+        raise _ConversationHistoryConflict
+    return tuple(
+        ConversationMessage(role=message.role, content=message.content) for message in messages
+    )
 
 
 def _error(code: str, message: str, status: int) -> JSONResponse:
@@ -316,28 +321,28 @@ def build_chat_router() -> APIRouter:
                     409,
                 )
 
-            user_message = await store.append_message(
-                WorkflowMessage(
-                    message_id=uuid4(),
-                    session_id=current_session.session_id,
-                    author_user_id=user.user_id,
-                    role="user",
-                    content=content,
-                    created_at=datetime.now(UTC),
-                    client_message_id=payload.client_request_id or uuid4(),
-                )
-            )
             stored_messages = await store.list_messages(
                 current_session.session_id,
                 user.user_id,
-                limit=MAX_CONVERSATION_HISTORY_MESSAGES + 1,
+                limit=MAX_CONVERSATION_HISTORY_MESSAGES,
             )
-            history = _completed_history(
-                [
-                    message
-                    for message in stored_messages
-                    if message.message_id != user_message.message_id
-                ]
+            try:
+                history = _completed_history(stored_messages)
+            except _ConversationHistoryConflict:
+                return _error(
+                    "conversation_conflict",
+                    "Another operation is updating this chat session.",
+                    409,
+                )
+            expected_latest_message_id = stored_messages[-1].message_id if stored_messages else None
+            user_message = WorkflowMessage(
+                message_id=uuid4(),
+                session_id=current_session.session_id,
+                author_user_id=user.user_id,
+                role="user",
+                content=content,
+                created_at=datetime.now(UTC),
+                client_message_id=payload.client_request_id or uuid4(),
             )
             try:
                 reply = await engine.reply_to_conversation(
@@ -389,7 +394,19 @@ def build_chat_router() -> APIRouter:
                     502,
                 )
 
-            stored_assistant = await store.append_message(assistant_message)
+            try:
+                stored_turn = await store.append_conversation_turn(
+                    user_message=user_message,
+                    assistant_message=assistant_message,
+                    expected_latest_message_id=expected_latest_message_id,
+                )
+                stored_assistant = stored_turn[1]
+            except ConversationTurnConflictError:
+                return _error(
+                    "conversation_conflict",
+                    "Another operation updated this chat session. Please retry.",
+                    409,
+                )
             return ConversationCreateResponse(
                 session_id=current_session.session_id,
                 user_message_id=user_message.message_id,
