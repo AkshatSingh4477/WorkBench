@@ -1,9 +1,12 @@
 """FastAPI composition root for the local WorkBench service."""
 
 import hmac
+import shutil
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
+from uuid import uuid4
 
 import uvicorn
 from fastapi import APIRouter, FastAPI, Request
@@ -12,24 +15,47 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from starlette.middleware.base import RequestResponseEndpoint
 
+from app.ai.local_engine import create_local_ai_engine
 from app.api.auth import build_auth_router, clear_session_cookie
 from app.api.chat import build_chat_router
 from app.api.contracts import ErrorResponse
 from app.api.health_contracts import HealthResponse, HealthStatus
 from app.api.sessions import build_session_router
+from app.artifacts import LibreOfficePdfConverter, LocalDocumentArtifactExecutor
 from app.auth.service import AuthError, AuthService
 from app.config import ApplicationSettings
 from app.health import ApplicationDependencies, build_health_response
+from app.local_health import LocalSystemHealthProvider
+from app.ports.local_backend import (
+    LocalDeploymentProof,
+    WorkflowAdmissionStatus,
+    WorkflowMessage,
+    WorkflowRunAdmission,
+)
+from app.sandbox import DockerSandboxExecutor
 from app.storage import (
+    LocalKnowledgeSourceStore,
     LocalSessionWorkspaceStore,
     LocalSQLiteDatabase,
     SQLiteActivityEventStore,
+    SQLiteApprovalStore,
+    SQLiteArtifactStore,
     SQLiteAuditStore,
     SQLiteAuthSessionStore,
+    SQLiteDraftStore,
     SQLiteIdentityStore,
     SQLiteSessionFileStore,
     SQLiteWorkflowStore,
 )
+from app.tools.registry import ToolRegistry
+from app.workflow.contracts import (
+    ActivityEvent,
+    ActivityEventType,
+    WorkflowRun,
+    WorkflowRunStatus,
+    WorkflowStage,
+)
+from app.workflow.runner import CheckpointAwareWorkflowRunner, InspectionWorkflowInputPolicy
 
 
 def _health_router(
@@ -87,22 +113,157 @@ async def _lifespan(dependencies: ApplicationDependencies) -> AsyncIterator[None
             await dependencies.shutdown()
 
 
-def compose_runtime_dependencies(settings: ApplicationSettings) -> ApplicationDependencies:
+def compose_runtime_dependencies(
+    settings: ApplicationSettings,
+    *,
+    workflow_input_policy: InspectionWorkflowInputPolicy | None = None,
+) -> ApplicationDependencies:
     """Compose the local SQLite auth stores for a normal service process."""
 
     database = LocalSQLiteDatabase(settings.database_path)
     workflow_store = SQLiteWorkflowStore(database)
+    workspaces = LocalSessionWorkspaceStore(settings.sessions_root)
+    files = SQLiteSessionFileStore(database, workspaces)
+    approvals = SQLiteApprovalStore(database)
+    artifacts = SQLiteArtifactStore(database)
+    drafts = SQLiteDraftStore(database)
+    knowledge = LocalKnowledgeSourceStore(database, settings.knowledge_root)
+    artifact_executor = LocalDocumentArtifactExecutor(
+        drafts,
+        artifacts,
+        workspaces,
+        LibreOfficePdfConverter(
+            settings.pdf_converter_executable,
+            timeout_seconds=settings.pdf_timeout_seconds,
+        ),
+    )
+    sandbox_executor = DockerSandboxExecutor(database, files, settings)
+    ai_engine = create_local_ai_engine(knowledge_root=knowledge.approved_knowledge_root())
+    tool_registry = ToolRegistry(approvals, artifact_executor, sandbox_executor)
+    workflow_runner = (
+        CheckpointAwareWorkflowRunner(
+            workflows=workflow_store,
+            drafts=drafts,
+            approvals=approvals,
+            ai_engine=ai_engine,
+            tool_registry=tool_registry,
+            input_policy=workflow_input_policy,
+            lease_seconds=settings.workflow_lease_seconds,
+        )
+        if workflow_input_policy is not None
+        else None
+    )
+
+    async def fail_recovery_run(run: WorkflowRun) -> None:
+        """Terminally fail one unrecoverable run through the typed store boundary."""
+
+        current = await workflow_store.get_run(
+            workflow_run_id=run.workflow_run_id,
+            session_id=run.session_id,
+            owner_user_id=run.owner_user_id,
+        )
+        if current is None or current.status in {
+            WorkflowRunStatus.COMPLETED,
+            WorkflowRunStatus.FAILED,
+            WorkflowRunStatus.APPROVAL_REJECTED,
+        }:
+            return
+        await workflow_store.compare_and_set_stage(
+            session_id=current.session_id,
+            workflow_run_id=current.workflow_run_id,
+            owner_user_id=current.owner_user_id,
+            expected_stage=current.stage,
+            expected_stage_version=current.stage_version,
+            next_stage=WorkflowStage.FAILED,
+            next_status=WorkflowRunStatus.FAILED,
+            sandbox_attempts=current.sandbox_attempts,
+        )
+
+    async def _startup_with_recovery() -> None:
+        await database.initialize()
+        now = datetime.now(UTC)
+        interrupted = await workflow_store.mark_stale_runs_interrupted(
+            stale_before=now - timedelta(seconds=settings.workflow_lease_seconds),
+            interrupted_at=now,
+        )
+        for queued_run in await workflow_store.list_unfinished_runs():
+            if queued_run.status is not WorkflowRunStatus.QUEUED or workflow_runner is None:
+                continue
+            try:
+                admission = await workflow_store.get_admission(
+                    workflow_run_id=queued_run.workflow_run_id
+                )
+                if admission is None:
+                    await fail_recovery_run(queued_run)
+                    continue
+                await workflow_runner.run(admission)
+            except Exception:
+                await fail_recovery_run(queued_run)
+        for stale_run in interrupted:
+            claimed = await workflow_store.claim_retry(
+                workflow_run_id=stale_run.workflow_run_id,
+                expected_stage_version=stale_run.stage_version,
+                lease_expires_at=now + timedelta(seconds=settings.workflow_lease_seconds),
+            )
+            if claimed is None:
+                continue
+            if workflow_runner is None:
+                await fail_recovery_run(claimed)
+                continue
+            try:
+                selected_uploads = await workflow_store.get_run_inputs(
+                    workflow_run_id=claimed.workflow_run_id,
+                )
+                synthetic_message = WorkflowMessage(
+                    message_id=uuid4(),
+                    session_id=claimed.session_id,
+                    author_user_id=claimed.owner_user_id,
+                    role="user",
+                    content="[startup recovery]",
+                    created_at=now,
+                )
+                admission = WorkflowRunAdmission(
+                    status=WorkflowAdmissionStatus.CREATED,
+                    run=claimed,
+                    message=synthetic_message,
+                    selected_uploads=selected_uploads,
+                    accepted_event=ActivityEvent(
+                        event_id=0,
+                        session_id=claimed.session_id,
+                        workflow_run_id=claimed.workflow_run_id,
+                        event_type=ActivityEventType.MESSAGE_ACCEPTED,
+                        occurred_at=now,
+                    ),
+                )
+                await workflow_runner.run(admission)
+            except Exception:
+                await fail_recovery_run(claimed)
+
     return ApplicationDependencies(
+        ai_engine=ai_engine,
+        system_health_provider=LocalSystemHealthProvider(database, settings),
         identity_store=SQLiteIdentityStore(database),
         auth_session_store=SQLiteAuthSessionStore(database),
         audit_store=SQLiteAuditStore(database),
         chat_store=workflow_store,
         workflow_store=workflow_store,
-        session_file_store=SQLiteSessionFileStore(
-            database, LocalSessionWorkspaceStore(settings.sessions_root)
-        ),
+        session_file_store=files,
         activity_event_store=SQLiteActivityEventStore(database),
-        startup=database.initialize,
+        approval_store=approvals,
+        artifact_store=artifacts,
+        artifact_executor=artifact_executor,
+        knowledge_source_store=knowledge,
+        draft_store=drafts,
+        sandbox_executor=sandbox_executor,
+        workflow_runner=workflow_runner,
+        tool_registry=tool_registry,
+        deployment_proof=LocalDeploymentProof(
+            model_endpoint_classification="loopback",
+            pdf_converter_available=shutil.which(settings.pdf_converter_executable) is not None,
+            docker_available=shutil.which(settings.docker_executable) is not None,
+        ),
+        startup=_startup_with_recovery,
+        shutdown=ai_engine.close,
     )
 
 
@@ -153,6 +314,7 @@ def create_app(
         version="v1",
         lifespan=lambda _: _lifespan(resolved_dependencies),
     )
+
     @application.middleware("http")
     async def require_managed_capability(
         request: Request, call_next: RequestResponseEndpoint
@@ -192,6 +354,7 @@ def create_app(
     application.state.workflow_store = resolved_dependencies.workflow_store
     application.state.session_file_store = resolved_dependencies.session_file_store
     application.state.activity_event_store = resolved_dependencies.activity_event_store
+    application.state.workflow_runner = resolved_dependencies.workflow_runner
     application.state.upload_max_bytes = resolved_settings.upload_max_bytes
     application.add_exception_handler(RequestValidationError, _validation_error_handler)
     application.add_exception_handler(AuthError, _auth_error_handler)

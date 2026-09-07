@@ -85,21 +85,13 @@ async def test_initialize_creates_workflow_runs_without_public_sequence(
     await database.initialize()
 
     async with database.open() as connection:
-        columns = await (
-            await connection.execute("PRAGMA table_info(workflow_runs)")
-        ).fetchall()
-        indexes = await (
-            await connection.execute("PRAGMA index_list(workflow_runs)")
-        ).fetchall()
+        columns = await (await connection.execute("PRAGMA table_info(workflow_runs)")).fetchall()
+        indexes = await (await connection.execute("PRAGMA index_list(workflow_runs)")).fetchall()
         foreign_keys = list(
-            await (
-                await connection.execute("PRAGMA foreign_key_list(workflow_runs)")
-            ).fetchall()
+            await (await connection.execute("PRAGMA foreign_key_list(workflow_runs)")).fetchall()
         )
         tables = await (
-            await connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            )
+            await connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         ).fetchall()
 
     assert [row["name"] for row in columns] == [
@@ -114,6 +106,9 @@ async def test_initialize_creates_workflow_runs_without_public_sequence(
         "sandbox_attempts",
         "created_at",
         "updated_at",
+        "execution_lease_expires_at",
+        "interrupted_at",
+        "retryable",
     ]
     assert "sequence" not in WorkflowRun.model_fields
     assert "workflow_runs_session_current" in {row["name"] for row in indexes}
@@ -200,7 +195,11 @@ async def test_get_current_run_returns_newest_owner_scoped_run_after_restart(
     database, store = await _store(tmp_path)
     session = _session()
     empty_session = _session(owner_user_id=session.owner_user_id)
-    first_run = _run(session)
+    first_run = _run(
+        session,
+        stage=WorkflowStage.COMPLETED,
+        status=WorkflowRunStatus.COMPLETED,
+    )
     second_run = _run(
         session,
         stage=WorkflowStage.EXTRACTING,
@@ -434,7 +433,7 @@ async def test_concurrent_compare_and_set_has_exactly_one_winner(tmp_path: Path)
 
 
 @pytest.mark.asyncio
-async def test_older_run_transition_does_not_replace_newer_session_projection(
+async def test_database_rejects_a_second_nonterminal_run(
     tmp_path: Path,
 ) -> None:
     _, store = await _store(tmp_path)
@@ -448,23 +447,8 @@ async def test_older_run_transition_does_not_replace_newer_session_projection(
     )
     await store.create_session(session)
     await store.create_run(older)
-    await store.create_run(newer)
-
-    transitioned = await store.compare_and_set_stage(
-        session_id=session.session_id,
-        workflow_run_id=older.workflow_run_id,
-        owner_user_id=session.owner_user_id,
-        expected_stage=older.stage,
-        expected_stage_version=older.stage_version,
-        next_stage=WorkflowStage.EXTRACTING,
-        next_status=WorkflowRunStatus.ACTIVE,
-        sandbox_attempts=0,
-    )
-    projected = await store.get_session(session.session_id, session.owner_user_id)
-
-    assert transitioned is not None
-    assert projected.stage is WorkflowStage.DRAFTING
-    assert projected.updated_at == newer.updated_at
+    with pytest.raises(WorkflowRunAlreadyExistsError):
+        await store.create_run(newer)
 
 
 @pytest.mark.asyncio
@@ -633,3 +617,60 @@ async def test_sqlite_constraints_reject_invalid_run_values(
                     run.updated_at.isoformat(),
                 ),
             )
+
+
+@pytest.mark.asyncio
+async def test_initialize_reconciles_legacy_multiple_nonterminal_runs(
+    tmp_path: Path,
+) -> None:
+    """Regression: multiple nonterminal runs for one session must not break index creation."""
+
+    db_path = tmp_path / "workbench.db"
+    database = LocalSQLiteDatabase(db_path)
+    await database.initialize()
+    store = SQLiteWorkflowStore(database)
+
+    item = _session()
+    await store.create_session(item)
+
+    run1 = _run(item, status=WorkflowRunStatus.ACTIVE, created_at=_CREATED_AT)
+    later = _CREATED_AT + timedelta(seconds=1)
+    run2 = _run(item, status=WorkflowRunStatus.QUEUED, created_at=later)
+
+    async with database.open() as connection:
+        await connection.execute(
+            "DROP INDEX IF EXISTS workflow_runs_one_nonterminal"
+        )
+        for run in (run1, run2):
+            await connection.execute(
+                """INSERT INTO workflow_runs (
+                    workflow_run_id, session_id, owner_user_id, workflow_type,
+                    stage, stage_version, status, sandbox_attempts,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    str(run.workflow_run_id),
+                    str(run.session_id),
+                    str(run.owner_user_id),
+                    run.workflow_type.value,
+                    run.stage.value,
+                    run.stage_version,
+                    run.status.value,
+                    run.sandbox_attempts,
+                    run.created_at.isoformat(),
+                    run.updated_at.isoformat(),
+                ),
+            )
+
+    fresh = LocalSQLiteDatabase(db_path)
+    await fresh.initialize()
+
+    async with fresh.open() as connection:
+        cursor = await connection.execute(
+            "SELECT status FROM workflow_runs WHERE session_id = ? ORDER BY sequence",
+            (str(item.session_id),),
+        )
+        statuses = [row["status"] for row in await cursor.fetchall()]
+
+    assert statuses.count("failed") == 1
+    assert statuses.count("active") + statuses.count("queued") == 1
