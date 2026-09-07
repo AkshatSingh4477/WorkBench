@@ -164,6 +164,7 @@ class PendingApprovalPreparation(ApiContractModel):
     run: WorkflowRun
     approval: Approval
     output: ValidatedToolCall
+    stage_changed_event: ActivityEvent
     required_event: ActivityEvent
     created_now: bool
 
@@ -321,9 +322,7 @@ class WorkflowStore(Protocol):
 
     async def admit_run(self, request: WorkflowRunAdmissionRequest) -> WorkflowRunAdmission: ...
 
-    async def get_admission(
-        self, *, workflow_run_id: UUID
-    ) -> WorkflowRunAdmission | None:
+    async def get_admission(self, *, workflow_run_id: UUID) -> WorkflowRunAdmission | None:
         """Restore one atomically persisted admission for recovery."""
         ...
 
@@ -348,6 +347,19 @@ class WorkflowStore(Protocol):
     async def mark_stale_runs_interrupted(
         self, *, stale_before: UtcTimestamp, interrupted_at: UtcTimestamp
     ) -> list[WorkflowRun]: ...
+
+    async def mark_run_interrupted(
+        self,
+        *,
+        workflow_run_id: UUID,
+        session_id: UUID,
+        owner_user_id: UUID,
+        expected_stage: WorkflowStage,
+        expected_stage_version: int,
+        interrupted_at: UtcTimestamp,
+    ) -> WorkflowRun | None:
+        """Make one cancelled active run immediately eligible for restart recovery."""
+        ...
 
     async def claim_retry(
         self, *, workflow_run_id: UUID, expected_stage_version: int, lease_expires_at: UtcTimestamp
@@ -374,6 +386,25 @@ class WorkflowStore(Protocol):
 
     async def append_message(self, message: WorkflowMessage) -> WorkflowMessage:
         """Append a sanitized user or assistant message."""
+        ...
+
+    async def append_assistant_completion(
+        self,
+        *,
+        run: WorkflowRun,
+        message: WorkflowMessage,
+    ) -> WorkflowMessage:
+        """Atomically append or replay an assistant message and its completion event."""
+        ...
+
+    async def finalize_failure(
+        self,
+        *,
+        run: WorkflowRun,
+        failure_code: str,
+        message: WorkflowMessage,
+    ) -> WorkflowRun | None:
+        """Atomically fail a run and persist its owner-visible completion."""
         ...
 
     async def compare_and_set_stage(

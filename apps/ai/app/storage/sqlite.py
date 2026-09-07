@@ -1685,9 +1685,7 @@ class SQLiteWorkflowStore:
                 "session already has different nonterminal work"
             ) from error
 
-    async def get_admission(
-        self, *, workflow_run_id: UUID
-    ) -> WorkflowRunAdmission | None:
+    async def get_admission(self, *, workflow_run_id: UUID) -> WorkflowRunAdmission | None:
         """Restore one committed admission with its original user message."""
 
         async with self._database.open() as connection:
@@ -1750,7 +1748,7 @@ class SQLiteWorkflowStore:
     ) -> None:
         row = await (
             await connection.execute(
-                """SELECT workflow_type, status FROM workflow_sessions
+                """SELECT workflow_type, stage, status FROM workflow_sessions
                 WHERE session_id = ? AND owner_user_id = ?""",
                 (str(request.run.session_id), str(request.run.owner_user_id)),
             )
@@ -1758,6 +1756,7 @@ class SQLiteWorkflowStore:
         if (
             row is None
             or row["workflow_type"] != request.run.workflow_type.value
+            or row["stage"] != WorkflowStage.COLLECTING_INPUTS.value
             or row["status"] != WorkflowStatus.ACTIVE.value
         ):
             raise WorkflowRunContextMismatchError("admission requires an active owned session")
@@ -2209,6 +2208,23 @@ class SQLiteWorkflowStore:
                 if cursor.rowcount != 1:
                     raise WorkflowApprovalConflictError("workflow transition lost its race")
                 await self._update_projection(connection, next_run)
+                stage_changed_event = await _insert_activity_event(
+                    connection,
+                    ActivityEvent(
+                        event_id=0,
+                        session_id=run.session_id,
+                        workflow_run_id=run.workflow_run_id,
+                        event_type=ActivityEventType.STAGE_CHANGED,
+                        occurred_at=approval.requested_at,
+                        payload={
+                            "previousStage": run.stage.value,
+                            "stage": next_run.stage.value,
+                            "stageVersion": next_run.stage_version,
+                            "status": next_run.status.value,
+                        },
+                    ),
+                    owner_user_id=run.owner_user_id,
+                )
                 event = await _insert_activity_event(
                     connection,
                     ActivityEvent(
@@ -2225,6 +2241,7 @@ class SQLiteWorkflowStore:
                     run=next_run,
                     approval=approval,
                     output=output,
+                    stage_changed_event=stage_changed_event,
                     required_event=event,
                     created_now=True,
                 )
@@ -2286,12 +2303,21 @@ class SQLiteWorkflowStore:
                 (str(run.workflow_run_id),),
             )
         ).fetchone()
-        if current is None or event_row is None:
+        stage_event_row = await (
+            await connection.execute(
+                """SELECT * FROM activity_events WHERE workflow_run_id = ?
+                AND event_type = 'workflow.stageChanged'
+                ORDER BY event_id DESC LIMIT 1""",
+                (str(run.workflow_run_id),),
+            )
+        ).fetchone()
+        if current is None or event_row is None or stage_event_row is None:
             raise WorkflowApprovalConflictError("prepared approval is incomplete")
         return PendingApprovalPreparation(
             run=self._workflow_run_from_row(current),
             approval=stored_approval,
             output=output,
+            stage_changed_event=SQLiteActivityEventStore._event_from_row(stage_event_row),
             required_event=SQLiteActivityEventStore._event_from_row(event_row),
             created_now=False,
         )
@@ -2460,6 +2486,126 @@ class SQLiteWorkflowStore:
             row = await cursor.fetchone()
         return self._workflow_run_from_row(row) if row is not None else None
 
+    async def finalize_failure(
+        self,
+        *,
+        run: WorkflowRun,
+        failure_code: str,
+        message: WorkflowMessage,
+    ) -> WorkflowRun | None:
+        """Atomically persist terminal failure state, events, and safe assistant text."""
+
+        if (
+            message.session_id != run.session_id
+            or message.author_user_id is not None
+            or message.role != "assistant"
+            or message.client_message_id != message.message_id
+        ):
+            raise WorkflowRunContextMismatchError("failure message context is inconsistent")
+
+        async with self._database.open() as connection:
+            await connection.execute("BEGIN IMMEDIATE")
+            row = await (
+                await connection.execute(
+                    f"""SELECT {_WORKFLOW_RUN_COLUMNS} FROM workflow_runs
+                    WHERE workflow_run_id = ? AND session_id = ? AND owner_user_id = ?""",
+                    (
+                        str(run.workflow_run_id),
+                        str(run.session_id),
+                        str(run.owner_user_id),
+                    ),
+                )
+            ).fetchone()
+            if row is None:
+                return None
+            current = self._workflow_run_from_row(row)
+            if current.status is WorkflowRunStatus.FAILED:
+                return current
+            if (
+                current.stage is not run.stage
+                or current.stage_version != run.stage_version
+                or current.status not in {WorkflowRunStatus.QUEUED, WorkflowRunStatus.ACTIVE}
+            ):
+                return None
+
+            failed = WorkflowRun.model_validate(
+                {
+                    **current.model_dump(),
+                    "stage": WorkflowStage.FAILED,
+                    "stage_version": current.stage_version + 1,
+                    "status": WorkflowRunStatus.FAILED,
+                    "updated_at": self._next_updated_at(current.updated_at),
+                    "execution_lease_expires_at": None,
+                    "interrupted_at": None,
+                    "retryable": False,
+                }
+            )
+            cursor = await connection.execute(
+                """UPDATE workflow_runs
+                SET stage = ?, stage_version = ?, status = ?, updated_at = ?,
+                    execution_lease_expires_at = NULL, interrupted_at = NULL, retryable = 0
+                WHERE workflow_run_id = ? AND session_id = ? AND owner_user_id = ?
+                  AND stage = ? AND stage_version = ?
+                  AND status IN ('queued', 'active')""",
+                (
+                    failed.stage.value,
+                    failed.stage_version,
+                    failed.status.value,
+                    failed.updated_at.isoformat(),
+                    str(current.workflow_run_id),
+                    str(current.session_id),
+                    str(current.owner_user_id),
+                    current.stage.value,
+                    current.stage_version,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+            await self._update_projection(connection, failed)
+            await self._insert_message(connection, message)
+            await _insert_activity_event(
+                connection,
+                ActivityEvent(
+                    event_id=0,
+                    session_id=failed.session_id,
+                    workflow_run_id=failed.workflow_run_id,
+                    event_type=ActivityEventType.STAGE_CHANGED,
+                    occurred_at=failed.updated_at,
+                    payload={
+                        "previousStage": current.stage.value,
+                        "stage": failed.stage.value,
+                        "stageVersion": failed.stage_version,
+                        "status": failed.status.value,
+                    },
+                ),
+                owner_user_id=failed.owner_user_id,
+            )
+            await _insert_activity_event(
+                connection,
+                ActivityEvent(
+                    event_id=0,
+                    session_id=failed.session_id,
+                    workflow_run_id=failed.workflow_run_id,
+                    event_type=ActivityEventType.WORKFLOW_FAILED,
+                    occurred_at=failed.updated_at,
+                    payload={"stage": failed.stage.value, "failureCode": failure_code},
+                ),
+                owner_user_id=failed.owner_user_id,
+            )
+            await _insert_activity_event(
+                connection,
+                ActivityEvent(
+                    event_id=0,
+                    session_id=failed.session_id,
+                    workflow_run_id=failed.workflow_run_id,
+                    event_type=ActivityEventType.MESSAGE_COMPLETED,
+                    occurred_at=message.created_at,
+                    payload={"messageId": str(message.message_id)},
+                ),
+                owner_user_id=failed.owner_user_id,
+            )
+            return failed
+
     async def compare_and_set_stage(
         self,
         *,
@@ -2625,6 +2771,81 @@ class SQLiteWorkflowStore:
             )
         return message
 
+    async def append_assistant_completion(
+        self,
+        *,
+        run: WorkflowRun,
+        message: WorkflowMessage,
+    ) -> WorkflowMessage:
+        """Atomically append or replay an assistant message and its completion event."""
+
+        if (
+            message.session_id != run.session_id
+            or message.author_user_id is not None
+            or message.role != "assistant"
+            or message.client_message_id != message.message_id
+        ):
+            raise WorkflowRunContextMismatchError("assistant completion context is inconsistent")
+
+        async with self._database.open() as connection:
+            await connection.execute("BEGIN IMMEDIATE")
+            context = await (
+                await connection.execute(
+                    """SELECT 1 FROM workflow_runs AS runs
+                    JOIN workflow_sessions AS sessions USING(session_id)
+                    WHERE runs.workflow_run_id = ? AND runs.session_id = ?
+                      AND runs.owner_user_id = ? AND runs.workflow_type = ?
+                      AND sessions.owner_user_id = runs.owner_user_id""",
+                    (
+                        str(run.workflow_run_id),
+                        str(run.session_id),
+                        str(run.owner_user_id),
+                        run.workflow_type.value,
+                    ),
+                )
+            ).fetchone()
+            if context is None:
+                raise WorkflowRunContextMismatchError("assistant completion run is unavailable")
+
+            stored = await self._stored_idempotent_message(connection, message)
+            if stored is None:
+                await self._insert_message(connection, message)
+                await connection.execute(
+                    """UPDATE workflow_sessions SET updated_at = ?
+                    WHERE session_id = ? AND owner_user_id = ?""",
+                    (
+                        message.created_at.isoformat(),
+                        str(message.session_id),
+                        str(run.owner_user_id),
+                    ),
+                )
+                stored = message
+
+            completion_event = ActivityEvent(
+                event_id=0,
+                session_id=run.session_id,
+                workflow_run_id=run.workflow_run_id,
+                event_type=ActivityEventType.MESSAGE_COMPLETED,
+                occurred_at=stored.created_at,
+                payload={"messageId": str(stored.message_id)},
+            )
+            payload_json = SQLiteActivityEventStore._serialize_payload(completion_event.payload)
+            existing_event = await (
+                await connection.execute(
+                    """SELECT 1 FROM activity_events
+                    WHERE session_id = ? AND workflow_run_id = ?
+                      AND event_type = 'message.completed' AND payload_json = ?""",
+                    (str(run.session_id), str(run.workflow_run_id), payload_json),
+                )
+            ).fetchone()
+            if existing_event is None:
+                await _insert_activity_event(
+                    connection,
+                    completion_event,
+                    owner_user_id=run.owner_user_id,
+                )
+            return stored
+
     async def _stored_idempotent_message(
         self, connection: aiosqlite.Connection, message: WorkflowMessage
     ) -> WorkflowMessage | None:
@@ -2729,9 +2950,7 @@ class SQLiteWorkflowStore:
             ).fetchall()
         return [self._workflow_run_from_row(row) for row in rows]
 
-    async def get_run_inputs(
-        self, *, workflow_run_id: UUID
-    ) -> tuple[SelectedUploadSnapshot, ...]:
+    async def get_run_inputs(self, *, workflow_run_id: UUID) -> tuple[SelectedUploadSnapshot, ...]:
         """Return persisted selected uploads for a workflow run."""
 
         async with self._database.open() as connection:
@@ -2786,6 +3005,44 @@ class SQLiteWorkflowStore:
                 )
             ).fetchall()
         return [self._workflow_run_from_row(row) for row in rows]
+
+    async def mark_run_interrupted(
+        self,
+        *,
+        workflow_run_id: UUID,
+        session_id: UUID,
+        owner_user_id: UUID,
+        expected_stage: WorkflowStage,
+        expected_stage_version: int,
+        interrupted_at: UtcTimestamp,
+    ) -> WorkflowRun | None:
+        """Mark one cancelled active run retryable without waiting for its lease to expire."""
+
+        async with self._database.open() as connection:
+            cursor = await connection.execute(
+                """UPDATE workflow_runs SET interrupted_at = ?, retryable = 1,
+                    execution_lease_expires_at = NULL
+                WHERE workflow_run_id = ? AND session_id = ? AND owner_user_id = ?
+                  AND stage = ? AND stage_version = ?
+                  AND status = 'active' AND retryable = 0""",
+                (
+                    interrupted_at.isoformat(),
+                    str(workflow_run_id),
+                    str(session_id),
+                    str(owner_user_id),
+                    expected_stage.value,
+                    expected_stage_version,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = await (
+                await connection.execute(
+                    f"SELECT {_WORKFLOW_RUN_COLUMNS} FROM workflow_runs WHERE workflow_run_id = ?",
+                    (str(workflow_run_id),),
+                )
+            ).fetchone()
+        return self._workflow_run_from_row(row) if row is not None else None
 
     async def claim_retry(
         self, *, workflow_run_id: UUID, expected_stage_version: int, lease_expires_at: UtcTimestamp
@@ -2926,6 +3183,26 @@ class SQLiteActivityEventStore:
                     session_id=event.session_id,
                     owner_user_id=owner_user_id,
                 )
+
+            if (
+                event.event_type is ActivityEventType.MESSAGE_COMPLETED
+                and event.workflow_run_id is not None
+            ):
+                existing = await (
+                    await connection.execute(
+                        """SELECT * FROM activity_events
+                        WHERE session_id = ? AND workflow_run_id = ?
+                          AND event_type = 'message.completed' AND payload_json = ?
+                        LIMIT 1""",
+                        (
+                            str(event.session_id),
+                            str(event.workflow_run_id),
+                            self._serialize_payload(event.payload),
+                        ),
+                    )
+                ).fetchone()
+                if existing is not None:
+                    return self._event_from_row(existing)
 
             persisted = await _insert_activity_event(connection, event, owner_user_id=owner_user_id)
         return persisted

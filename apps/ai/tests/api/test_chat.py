@@ -441,6 +441,7 @@ async def test_concurrent_retries_of_one_append_replay_the_stored_message(tmp_pa
 
 async def test_message_admission_requires_a_configured_workflow_runner(tmp_path: Path) -> None:
     app, cookie, _ = await _build_app_with_two_employees(tmp_path)
+    app.state.workflow_runner = None
     async with app.router.lifespan_context(app):
         session_id = await _create_session(app, cookie)
         response = json.loads(

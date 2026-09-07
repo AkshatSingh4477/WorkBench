@@ -14,6 +14,7 @@ from app.ai.schemas import (
     Finding,
     KnowledgeQuery,
     ProposedToolCall,
+    TaskDescriptor,
     VisualAnalysisRequest,
 )
 from app.ports.local_backend import (
@@ -45,7 +46,12 @@ NOW = datetime(2026, 9, 7, 12, tzinfo=UTC)
 
 
 class DraftOnlyPolicy:
-    def visual_analysis_request(self, admission: WorkflowRunAdmission) -> VisualAnalysisRequest:
+    def task_descriptor(self, admission: WorkflowRunAdmission) -> TaskDescriptor:
+        raise AssertionError("persisted findings must skip capability selection")
+
+    async def visual_analysis_request(
+        self, admission: WorkflowRunAdmission
+    ) -> VisualAnalysisRequest:
         raise AssertionError("persisted findings must skip extraction")
 
     def knowledge_query(
