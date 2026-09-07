@@ -23,9 +23,15 @@ from app.ai.schemas import (
     AgentContext,
     AgentProposal,
     ApprovedKnowledgeRoot,
+    Capability,
+    CapabilityDecision,
     CodeRepairContent,
     CodeRepairRequest,
+    ConversationGenerationRequest,
+    ConversationGenerationResult,
     ConversationMessage,
+    ConversationReply,
+    ConversationRequest,
     DraftRequest,
     EmbeddingRequest,
     EmbeddingResult,
@@ -109,6 +115,16 @@ class RecordingModelAdapter:
             model=request.model,
             text=json.dumps(output),
             structured_output=output,
+            metrics=sample_inference_metrics(),
+        )
+
+    async def generate_conversation(
+        self, request: ConversationGenerationRequest
+    ) -> ConversationGenerationResult:
+        self.calls.append(f"generate_conversation:{request.model}")
+        return ConversationGenerationResult(
+            model=request.model,
+            text="The previous message was: " + request.messages[-1].content,
             metrics=sample_inference_metrics(),
         )
 
@@ -198,6 +214,12 @@ async def test_local_engine_exposes_every_ai_operation_through_one_interface(
 
     health = await interface.health()
     decision = await interface.choose_capability(sample_task())
+    conversation: ConversationReply = await interface.reply_to_conversation(
+        ConversationRequest(
+            session_id="session-local-engine",
+            user_message="Can you confirm this is a local conversation?",
+        )
+    )
     context = AgentContext(
         task=sample_task(),
         conversation=(ConversationMessage(role="user", content="Prepare the note."),),
@@ -266,6 +288,8 @@ async def test_local_engine_exposes_every_ai_operation_through_one_interface(
     assert health.runtime_ready is True
     assert health.knowledge_ready is True
     assert decision.selected_model == "qwen3-vl:4b"
+    assert conversation.assistant_text.endswith("local conversation?")
+    assert conversation.model == "qwen3-vl:4b"
     assert plan == sample_task_plan()
     assert analysis == _vision_analysis()
     assert ingestion.document_id == "local-sop"
@@ -300,6 +324,40 @@ async def test_local_engine_reports_knowledge_health_without_exposing_failures()
     assert health.runtime_ready is True
     assert health.knowledge_ready is False
     assert health.knowledge_error == "KnowledgeIndexUnavailable"
+
+
+async def test_local_conversation_preserves_router_fallback_metadata() -> None:
+    """Keep a health-selected text fallback visible when adapter generation succeeds."""
+
+    model = RecordingModelAdapter({})
+    engine = LocalAIEngine(
+        AIEngineDependencies(
+            model_adapter=model,
+            knowledge_adapter=FakeKnowledgeAdapter(ready=False),
+            router=FakeCapabilityRouter(
+                decision=CapabilityDecision(
+                    capability=Capability.TEXT,
+                    selected_model="qwen3:1.7b",
+                    reason="The chat task requires local text reasoning.",
+                    used_fallback=True,
+                    fallback_reason="qwen3:4b is not installed.",
+                )
+            ),
+            model_profile=sample_model_profile(),
+        ),
+        visual_normalizer=FixedVisualNormalizer(),
+    )
+
+    reply = await engine.reply_to_conversation(
+        ConversationRequest(
+            session_id="session-fallback",
+            user_message="Confirm the local fallback.",
+        )
+    )
+
+    assert reply.model == "qwen3:1.7b"
+    assert reply.used_fallback is True
+    assert reply.fallback_reason == "qwen3:4b is not installed."
 
 
 async def test_local_engine_factory_does_not_require_running_ollama(tmp_path: Path) -> None:
