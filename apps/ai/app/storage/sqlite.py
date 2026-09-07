@@ -2997,9 +2997,13 @@ class SQLiteActivityEventStore:
                     await connection.execute(
                         """SELECT * FROM activity_events
                         WHERE session_id = ? AND workflow_run_id = ?
-                          AND event_type = 'message.completed'
+                          AND event_type = 'message.completed' AND payload_json = ?
                         LIMIT 1""",
-                        (str(event.session_id), str(event.workflow_run_id)),
+                        (
+                            str(event.session_id),
+                            str(event.workflow_run_id),
+                            self._serialize_payload(event.payload),
+                        ),
                     )
                 ).fetchone()
                 if existing is not None:

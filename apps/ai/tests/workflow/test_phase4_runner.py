@@ -554,3 +554,55 @@ async def test_malformed_code_proposal_is_a_policy_failure_not_an_internal_error
         if event.event_type is ActivityEventType.WORKFLOW_FAILED
     ]
     assert failed_events[-1].payload["failureCode"] == "workflow_validation_failed"
+
+
+@pytest.mark.asyncio
+async def test_code_response_and_failure_have_distinct_durable_completions(
+    tmp_path: Path,
+) -> None:
+    """A planner response and the policy failure that follows must both remain observable."""
+
+    workflows, drafts, approvals, events, files, admission = await _admit(
+        tmp_path,
+        WorkflowType.CODE_REPAIR,
+        file_name="validator.py",
+        mime_type="text/x-python",
+        content=b"print('local')\n",
+    )
+    ai = FakeAIEngine(
+        capability_decision=CapabilityDecision(
+            capability=Capability.TEXT, selected_model="qwen3:4b", reason="Local code task."
+        ),
+        action_proposal=AgentProposal(response_text="The selected validator needs review."),
+    )
+    runner = CheckpointAwareWorkflowRunner(
+        workflows=workflows,
+        drafts=drafts,
+        approvals=approvals,
+        ai_engine=ai,
+        tool_registry=ToolRegistry(cast(Any, approvals), cast(Any, object()), cast(Any, object())),
+        input_policy=LocalInspectionWorkflowInputPolicy(files),
+        events=events,
+    )
+
+    await runner.run(admission)
+
+    messages = await workflows.list_messages(
+        admission.run.session_id, admission.run.owner_user_id
+    )
+    assert [message.content for message in messages] == [
+        admission.message.content,
+        "The selected validator needs review.",
+        "The workflow could not complete. Please review the activity trace.",
+    ]
+    completed = [
+        event
+        for event in await events.replay(
+            session_id=admission.run.session_id,
+            owner_user_id=admission.run.owner_user_id,
+            after_event_id=0,
+        )
+        if event.event_type is ActivityEventType.MESSAGE_COMPLETED
+    ]
+    assert len(completed) == 2
+    assert completed[0].payload["messageId"] != completed[1].payload["messageId"]
