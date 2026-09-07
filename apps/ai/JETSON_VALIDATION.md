@@ -174,3 +174,26 @@ validation does. After Backend 1 and Backend 2 finish integration:
 
 AI code must not implement workflow state, approvals, artifact writing, sandbox execution, or
 Electron delivery to make this smoke test pass.
+
+## Manual Qwen conversation endpoint smoke test
+
+This check is opt-in and requires a locally provisioned employee plus a preloaded `qwen3:4b`.
+It does not require the vision or embedding models to be installed. Start the standalone FastAPI
+service with a non-default local signing secret, log in through `POST /auth/login`, and retain the
+returned cookie. Then create an owned session through `POST /chat/sessions` and send two requests
+to `POST /chat/sessions/{sessionId}/conversation`:
+
+```json
+{"message":"State your model name in one short sentence.","clientRequestId":"<new UUID>"}
+```
+
+```json
+{"message":"What did I ask you in my previous message?","clientRequestId":"<new UUID>"}
+```
+
+Send `Origin: http://127.0.0.1:5173` on each authenticated request. A passing result returns HTTP
+200 for both turns, identifies `qwen3:4b` in `selectedModel`, and answers the follow-up using prior
+session context. Confirm `GET /chat/sessions/{sessionId}/messages` contains user/assistant pairs in
+order. Full `/health` may remain degraded when vision or embeddings are absent; that is expected
+and does not make text chat unavailable. Monitor the device during the requests and confirm the
+service contacts only the configured loopback Ollama endpoint.

@@ -4,6 +4,7 @@ from uuid import UUID
 
 from pydantic import Field, field_validator
 
+from app.ai.schemas import InferenceMetrics
 from app.api.contracts import ApiContractModel
 from app.ports.local_backend import WorkflowMessage
 from app.workflow.contracts import WorkflowSession, WorkflowType
@@ -51,3 +52,23 @@ class ChatMessageListEnvelope(ApiContractModel):
     """The latest messages of one chat thread in chronological order."""
 
     messages: list[WorkflowMessage]
+
+
+class ConversationCreateRequest(ApiContractModel):
+    """One text-only chat turn; extra workflow and retrieval fields are rejected."""
+
+    message: str = Field(min_length=1, max_length=20_000)
+    client_request_id: UUID | None = None
+
+
+class ConversationCreateResponse(ApiContractModel):
+    """Persisted identifiers and safe facts for one complete local reply."""
+
+    session_id: UUID
+    user_message_id: UUID
+    assistant_message_id: UUID
+    assistant_text: str = Field(min_length=1, max_length=20_000)
+    selected_model: str = Field(min_length=1)
+    used_fallback: bool
+    fallback_reason: str | None = None
+    metrics: InferenceMetrics | None = None

@@ -1,19 +1,38 @@
 """Employee chat routes over the private managed pipe; no workflow control here."""
 
-from contextlib import suppress
+import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
 from typing import Annotated, cast
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 from fastapi import APIRouter, Path, Request
 from fastapi.responses import JSONResponse
 
+from app.ai.engine import AIEngine
+from app.ai.errors import (
+    ConversationContextTooLarge,
+    InvalidStructuredOutput,
+    ModelCapacityError,
+    ModelNotInstalled,
+    ModelRequestFailed,
+    ModelRequestTimeout,
+    ModelRuntimeUnavailable,
+)
+from app.ai.schemas import (
+    MAX_CONVERSATION_HISTORY_MESSAGES,
+    ConversationMessage,
+    ConversationRequest,
+)
 from app.api.auth import AllowedOrigin, CurrentEmployee
 from app.api.chat_contracts import (
     ChatMessageAppendRequest,
     ChatMessageListEnvelope,
     ChatSessionCreateRequest,
     ChatSessionListEnvelope,
+    ConversationCreateRequest,
+    ConversationCreateResponse,
 )
 from app.api.contracts import ErrorResponse
 from app.auth.contracts import AuthenticatedUser
@@ -29,7 +48,11 @@ from app.ports.local_backend import (
     WorkflowRunAdmissionRequest,
     WorkflowStore,
 )
-from app.storage import SessionAlreadyExistsError, WorkflowSessionNotFoundError
+from app.storage import (
+    ConversationTurnConflictError,
+    SessionAlreadyExistsError,
+    WorkflowSessionNotFoundError,
+)
 from app.storage.sqlite import WorkflowAdmissionConflictError
 from app.workflow.contracts import (
     WorkflowRun,
@@ -60,8 +83,61 @@ _APPEND_ERROR_RESPONSES: dict[int | str, dict[str, object]] = {
     **_READ_ERROR_RESPONSES,
     409: {"model": ErrorResponse, "description": "The chat session no longer accepts messages"},
 }
+_CONVERSATION_ERROR_RESPONSES: dict[int | str, dict[str, object]] = {
+    **_READ_ERROR_RESPONSES,
+    409: {"model": ErrorResponse, "description": "The chat session no longer accepts messages"},
+    413: {"model": ErrorResponse, "description": "Conversation context is too large"},
+    502: {"model": ErrorResponse, "description": "Invalid local AI response"},
+    504: {"model": ErrorResponse, "description": "Local generation timed out"},
+}
 
 SessionId = Annotated[UUID, Path(description="Owned chat session identifier")]
+
+
+class _ConversationTurnLocks:
+    """Serialize complete turns per session without retaining inactive locks."""
+
+    def __init__(self) -> None:
+        self._registry_lock = asyncio.Lock()
+        self._locks: dict[UUID, tuple[asyncio.Lock, int]] = {}
+
+    @asynccontextmanager
+    async def serialize(self, session_id: UUID) -> AsyncIterator[None]:
+        async with self._registry_lock:
+            lock, users = self._locks.get(session_id, (asyncio.Lock(), 0))
+            self._locks[session_id] = (lock, users + 1)
+
+        acquired = False
+        try:
+            await lock.acquire()
+            acquired = True
+            yield
+        finally:
+            if acquired:
+                lock.release()
+            async with self._registry_lock:
+                current_lock, current_users = self._locks[session_id]
+                if current_users == 1:
+                    del self._locks[session_id]
+                else:
+                    self._locks[session_id] = (current_lock, current_users - 1)
+
+
+class _ConversationHistoryConflict(RuntimeError):
+    """Stored messages do not form complete user/assistant turns."""
+
+
+def _completed_history(messages: list[WorkflowMessage]) -> tuple[ConversationMessage, ...]:
+    """Return complete ordered pairs, rejecting an in-progress cross-route turn."""
+
+    if len(messages) % 2 != 0 or any(
+        message.role != ("user" if index % 2 == 0 else "assistant")
+        for index, message in enumerate(messages)
+    ):
+        raise _ConversationHistoryConflict
+    return tuple(
+        ConversationMessage(role=message.role, content=message.content) for message in messages
+    )
 
 
 def _error(code: str, message: str, status: int) -> JSONResponse:
@@ -73,6 +149,7 @@ def build_chat_router() -> APIRouter:
     """Build the employee chat surface over owned workflow sessions."""
 
     router = APIRouter(prefix="/chat", tags=["chat"])
+    turn_locks = _ConversationTurnLocks()
 
     def _chat_store(request: Request) -> ChatStore | None:
         return cast(ChatStore | None, getattr(request.app.state, "chat_store", None))
@@ -200,6 +277,146 @@ def build_chat_router() -> APIRouter:
         return ChatMessageListEnvelope(
             messages=await store.list_messages(session.session_id, user.user_id)
         )
+
+    @router.post(
+        "/sessions/{session_id}/conversation",
+        response_model=ConversationCreateResponse,
+        responses=_CONVERSATION_ERROR_RESPONSES,
+    )
+    async def create_conversation_turn(
+        session_id: SessionId,
+        payload: ConversationCreateRequest,
+        _: AllowedOrigin,
+        user: CurrentEmployee,
+        request: Request,
+    ) -> ConversationCreateResponse | JSONResponse:
+        """Generate and persist one local text reply without workflow admission."""
+
+        content = payload.message.strip()
+        if not content:
+            return _error("invalid_message", "The message must not be blank.", 422)
+        store = _chat_store(request)
+        engine = cast(AIEngine | None, getattr(request.app.state, "ai_engine", None))
+        if store is None:
+            return _error(*_UNAVAILABLE, 503)
+        if engine is None:
+            return _error(
+                "text_model_unavailable",
+                "The local text model is unavailable.",
+                503,
+            )
+
+        session = await _owned_session(session_id, user, request)
+        if isinstance(session, JSONResponse):
+            return session
+
+        async with turn_locks.serialize(session.session_id):
+            current_session = await _owned_session(session_id, user, request)
+            if isinstance(current_session, JSONResponse):
+                return current_session
+            if current_session.status is not WorkflowStatus.ACTIVE:
+                return _error(
+                    "session_not_active",
+                    "This chat session is closed and no longer accepts messages.",
+                    409,
+                )
+
+            stored_messages = await store.list_messages(
+                current_session.session_id,
+                user.user_id,
+                limit=MAX_CONVERSATION_HISTORY_MESSAGES,
+            )
+            try:
+                history = _completed_history(stored_messages)
+            except _ConversationHistoryConflict:
+                return _error(
+                    "conversation_conflict",
+                    "Another operation is updating this chat session.",
+                    409,
+                )
+            expected_latest_message_id = stored_messages[-1].message_id if stored_messages else None
+            user_message = WorkflowMessage(
+                message_id=uuid4(),
+                session_id=current_session.session_id,
+                author_user_id=user.user_id,
+                role="user",
+                content=content,
+                created_at=datetime.now(UTC),
+                client_message_id=payload.client_request_id or uuid4(),
+            )
+            try:
+                reply = await engine.reply_to_conversation(
+                    ConversationRequest(
+                        session_id=str(current_session.session_id),
+                        user_message=user_message.content,
+                        history=history,
+                    )
+                )
+                if reply.session_id != str(current_session.session_id):
+                    raise ValueError("conversation reply session did not match the request")
+                assistant_message_id = uuid5(user_message.message_id, "assistant-reply")
+                assistant_message = WorkflowMessage(
+                    message_id=assistant_message_id,
+                    session_id=current_session.session_id,
+                    role="assistant",
+                    content=reply.assistant_text,
+                    created_at=datetime.now(UTC),
+                    client_message_id=assistant_message_id,
+                )
+            except ModelNotInstalled, ModelCapacityError:
+                return _error(
+                    "text_model_unavailable",
+                    "The local text model is unavailable.",
+                    503,
+                )
+            except ModelRuntimeUnavailable:
+                return _error(
+                    "ollama_unavailable",
+                    "The local Ollama service is unavailable.",
+                    503,
+                )
+            except ModelRequestTimeout:
+                return _error(
+                    "generation_timeout",
+                    "The local text generation request timed out.",
+                    504,
+                )
+            except ConversationContextTooLarge:
+                return _error(
+                    "conversation_too_large",
+                    "The conversation is too large for the configured local text model.",
+                    413,
+                )
+            except InvalidStructuredOutput, ModelRequestFailed, ValueError:
+                return _error(
+                    "invalid_ai_response",
+                    "The local text model returned an invalid response.",
+                    502,
+                )
+
+            try:
+                stored_turn = await store.append_conversation_turn(
+                    user_message=user_message,
+                    assistant_message=assistant_message,
+                    expected_latest_message_id=expected_latest_message_id,
+                )
+                stored_assistant = stored_turn[1]
+            except ConversationTurnConflictError:
+                return _error(
+                    "conversation_conflict",
+                    "Another operation updated this chat session. Please retry.",
+                    409,
+                )
+            return ConversationCreateResponse(
+                session_id=current_session.session_id,
+                user_message_id=user_message.message_id,
+                assistant_message_id=stored_assistant.message_id,
+                assistant_text=stored_assistant.content,
+                selected_model=reply.model,
+                used_fallback=reply.used_fallback,
+                fallback_reason=reply.fallback_reason,
+                metrics=reply.metrics,
+            )
 
     @router.post(
         "/sessions/{session_id}/messages",

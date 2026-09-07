@@ -1581,6 +1581,10 @@ class WorkflowAdmissionConflictError(RuntimeError):
     """An admission key or active-run slot conflicts with different work."""
 
 
+class ConversationTurnConflictError(RuntimeError):
+    """Conversation history changed before a complete turn could be stored."""
+
+
 class WorkflowResultConflictError(RuntimeError):
     """An immutable workflow checkpoint already contains different content."""
 
@@ -2771,6 +2775,78 @@ class SQLiteWorkflowStore:
             )
         return message
 
+    async def append_conversation_turn(
+        self,
+        *,
+        user_message: WorkflowMessage,
+        assistant_message: WorkflowMessage,
+        expected_latest_message_id: UUID | None,
+    ) -> tuple[WorkflowMessage, WorkflowMessage]:
+        """Atomically append a user/assistant pair against one history revision."""
+
+        if (
+            user_message.session_id != assistant_message.session_id
+            or user_message.author_user_id is None
+            or user_message.role != "user"
+            or assistant_message.author_user_id is not None
+            or assistant_message.role != "assistant"
+            or user_message.client_message_id is None
+            or assistant_message.client_message_id != assistant_message.message_id
+        ):
+            raise ValueError("conversation turn context is inconsistent")
+
+        try:
+            async with self._database.open() as connection:
+                await connection.execute("BEGIN IMMEDIATE")
+                session = await (
+                    await connection.execute(
+                        """SELECT status FROM workflow_sessions
+                        WHERE session_id = ? AND owner_user_id = ?""",
+                        (
+                            str(user_message.session_id),
+                            str(user_message.author_user_id),
+                        ),
+                    )
+                ).fetchone()
+                if session is None:
+                    raise WorkflowSessionNotFoundError(
+                        f"Workflow session not found: {user_message.session_id}"
+                    )
+                if session["status"] != WorkflowStatus.ACTIVE.value:
+                    raise ConversationTurnConflictError(
+                        "conversation session no longer accepts messages"
+                    )
+
+                latest = await (
+                    await connection.execute(
+                        """SELECT message_id FROM workflow_messages
+                        WHERE session_id = ? ORDER BY sequence DESC LIMIT 1""",
+                        (str(user_message.session_id),),
+                    )
+                ).fetchone()
+                latest_message_id = UUID(latest["message_id"]) if latest is not None else None
+                if latest_message_id != expected_latest_message_id:
+                    raise ConversationTurnConflictError(
+                        "conversation history changed during generation"
+                    )
+
+                await self._insert_message(connection, user_message)
+                await self._insert_message(connection, assistant_message)
+                await connection.execute(
+                    """UPDATE workflow_sessions SET updated_at = ?
+                    WHERE session_id = ? AND owner_user_id = ?""",
+                    (
+                        assistant_message.created_at.isoformat(),
+                        str(user_message.session_id),
+                        str(user_message.author_user_id),
+                    ),
+                )
+        except aiosqlite.IntegrityError as error:
+            raise ConversationTurnConflictError(
+                "conversation turn conflicts with an existing request"
+            ) from error
+        return user_message, assistant_message
+
     async def append_assistant_completion(
         self,
         *,
@@ -2899,8 +2975,14 @@ class SQLiteWorkflowStore:
             raise WorkflowSessionNotFoundError(f"Workflow session not found: {session_id}")
         return self._workflow_session_from_row(row)
 
-    async def list_messages(self, session_id: UUID, owner_user_id: UUID) -> list[WorkflowMessage]:
+    async def list_messages(
+        self, session_id: UUID, owner_user_id: UUID, *, limit: int | None = None
+    ) -> list[WorkflowMessage]:
         """Return the latest owned messages in durable chronological order."""
+
+        selected_limit = self._MAX_LISTED_MESSAGES if limit is None else limit
+        if selected_limit < 1 or selected_limit > self._MAX_LISTED_MESSAGES:
+            raise ValueError("message list limit is outside the supported bound")
 
         async with self._database.open() as connection:
             cursor = await connection.execute(
@@ -2915,7 +2997,7 @@ class SQLiteWorkflowStore:
                 ORDER BY messages.sequence DESC
                 LIMIT ?
                 """,
-                (str(session_id), str(owner_user_id), self._MAX_LISTED_MESSAGES),
+                (str(session_id), str(owner_user_id), selected_limit),
             )
             rows = list(await cursor.fetchall())
         return [self._message_from_row(row) for row in rows[::-1]]
