@@ -388,6 +388,16 @@ class WorkflowStore(Protocol):
         """Append a sanitized user or assistant message."""
         ...
 
+    async def finalize_failure(
+        self,
+        *,
+        run: WorkflowRun,
+        failure_code: str,
+        message: WorkflowMessage,
+    ) -> WorkflowRun | None:
+        """Atomically fail a run and persist its owner-visible completion."""
+        ...
+
     async def compare_and_set_stage(
         self,
         *,

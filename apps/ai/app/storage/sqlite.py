@@ -2486,6 +2486,126 @@ class SQLiteWorkflowStore:
             row = await cursor.fetchone()
         return self._workflow_run_from_row(row) if row is not None else None
 
+    async def finalize_failure(
+        self,
+        *,
+        run: WorkflowRun,
+        failure_code: str,
+        message: WorkflowMessage,
+    ) -> WorkflowRun | None:
+        """Atomically persist terminal failure state, events, and safe assistant text."""
+
+        if (
+            message.session_id != run.session_id
+            or message.author_user_id is not None
+            or message.role != "assistant"
+            or message.client_message_id != message.message_id
+        ):
+            raise WorkflowRunContextMismatchError("failure message context is inconsistent")
+
+        async with self._database.open() as connection:
+            await connection.execute("BEGIN IMMEDIATE")
+            row = await (
+                await connection.execute(
+                    f"""SELECT {_WORKFLOW_RUN_COLUMNS} FROM workflow_runs
+                    WHERE workflow_run_id = ? AND session_id = ? AND owner_user_id = ?""",
+                    (
+                        str(run.workflow_run_id),
+                        str(run.session_id),
+                        str(run.owner_user_id),
+                    ),
+                )
+            ).fetchone()
+            if row is None:
+                return None
+            current = self._workflow_run_from_row(row)
+            if current.status is WorkflowRunStatus.FAILED:
+                return current
+            if (
+                current.stage is not run.stage
+                or current.stage_version != run.stage_version
+                or current.status not in {WorkflowRunStatus.QUEUED, WorkflowRunStatus.ACTIVE}
+            ):
+                return None
+
+            failed = WorkflowRun.model_validate(
+                {
+                    **current.model_dump(),
+                    "stage": WorkflowStage.FAILED,
+                    "stage_version": current.stage_version + 1,
+                    "status": WorkflowRunStatus.FAILED,
+                    "updated_at": self._next_updated_at(current.updated_at),
+                    "execution_lease_expires_at": None,
+                    "interrupted_at": None,
+                    "retryable": False,
+                }
+            )
+            cursor = await connection.execute(
+                """UPDATE workflow_runs
+                SET stage = ?, stage_version = ?, status = ?, updated_at = ?,
+                    execution_lease_expires_at = NULL, interrupted_at = NULL, retryable = 0
+                WHERE workflow_run_id = ? AND session_id = ? AND owner_user_id = ?
+                  AND stage = ? AND stage_version = ?
+                  AND status IN ('queued', 'active')""",
+                (
+                    failed.stage.value,
+                    failed.stage_version,
+                    failed.status.value,
+                    failed.updated_at.isoformat(),
+                    str(current.workflow_run_id),
+                    str(current.session_id),
+                    str(current.owner_user_id),
+                    current.stage.value,
+                    current.stage_version,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+            await self._update_projection(connection, failed)
+            await self._insert_message(connection, message)
+            await _insert_activity_event(
+                connection,
+                ActivityEvent(
+                    event_id=0,
+                    session_id=failed.session_id,
+                    workflow_run_id=failed.workflow_run_id,
+                    event_type=ActivityEventType.STAGE_CHANGED,
+                    occurred_at=failed.updated_at,
+                    payload={
+                        "previousStage": current.stage.value,
+                        "stage": failed.stage.value,
+                        "stageVersion": failed.stage_version,
+                        "status": failed.status.value,
+                    },
+                ),
+                owner_user_id=failed.owner_user_id,
+            )
+            await _insert_activity_event(
+                connection,
+                ActivityEvent(
+                    event_id=0,
+                    session_id=failed.session_id,
+                    workflow_run_id=failed.workflow_run_id,
+                    event_type=ActivityEventType.WORKFLOW_FAILED,
+                    occurred_at=failed.updated_at,
+                    payload={"stage": failed.stage.value, "failureCode": failure_code},
+                ),
+                owner_user_id=failed.owner_user_id,
+            )
+            await _insert_activity_event(
+                connection,
+                ActivityEvent(
+                    event_id=0,
+                    session_id=failed.session_id,
+                    workflow_run_id=failed.workflow_run_id,
+                    event_type=ActivityEventType.MESSAGE_COMPLETED,
+                    occurred_at=message.created_at,
+                    payload={"messageId": str(message.message_id)},
+                ),
+                owner_user_id=failed.owner_user_id,
+            )
+            return failed
+
     async def compare_and_set_stage(
         self,
         *,

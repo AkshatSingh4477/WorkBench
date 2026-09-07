@@ -46,12 +46,12 @@ from app.tools.registry import ToolRegistry
 from app.workflow.contracts import (
     WorkflowRun,
     WorkflowRunStatus,
-    WorkflowStage,
 )
 from app.workflow.runner import (
     CheckpointAwareWorkflowRunner,
     InspectionWorkflowInputPolicy,
     LocalInspectionWorkflowInputPolicy,
+    build_failure_message,
 )
 from app.workflow.supervisor import WorkflowTaskSupervisor
 
@@ -165,15 +165,10 @@ def compose_runtime_dependencies(
             WorkflowRunStatus.APPROVAL_REJECTED,
         }:
             return
-        await workflow_store.compare_and_set_stage(
-            session_id=current.session_id,
-            workflow_run_id=current.workflow_run_id,
-            owner_user_id=current.owner_user_id,
-            expected_stage=current.stage,
-            expected_stage_version=current.stage_version,
-            next_stage=WorkflowStage.FAILED,
-            next_status=WorkflowRunStatus.FAILED,
-            sandbox_attempts=current.sandbox_attempts,
+        await workflow_store.finalize_failure(
+            run=current,
+            failure_code="workflow_recovery_failed",
+            message=build_failure_message(current, created_at=datetime.now(UTC)),
         )
 
     async def _startup_with_recovery() -> None:

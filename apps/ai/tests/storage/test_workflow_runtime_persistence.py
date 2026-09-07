@@ -1,6 +1,7 @@
 """Atomic workflow admission, checkpoints, approval, and recovery tests."""
 
 import asyncio
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -15,7 +16,12 @@ from app.ports.local_backend import (
     WorkflowMessage,
     WorkflowRunAdmissionRequest,
 )
-from app.storage import LocalSQLiteDatabase, SQLiteDraftStore, SQLiteWorkflowStore
+from app.storage import (
+    LocalSQLiteDatabase,
+    SQLiteActivityEventStore,
+    SQLiteDraftStore,
+    SQLiteWorkflowStore,
+)
 from app.storage.sqlite import (
     _NONTERMINAL_RUN_STATUSES,
     WorkflowAdmissionConflictError,
@@ -282,6 +288,91 @@ async def test_pending_approval_race_is_one_atomic_result(tmp_path: Path) -> Non
             )
         ).fetchone()
         assert row is not None and row["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_failure_finalization_rolls_back_and_retries_as_one_atomic_result(
+    tmp_path: Path,
+) -> None:
+    """A persistence fault cannot leave a terminal run without its safe completion."""
+
+    database = LocalSQLiteDatabase(tmp_path / "workbench.db")
+    await database.initialize()
+    store = SQLiteWorkflowStore(database)
+    item = session()
+    await store.create_session(item)
+    admitted = await store.admit_run(admission(item, uuid4()))
+    active = await store.compare_and_set_stage(
+        session_id=admitted.run.session_id,
+        workflow_run_id=admitted.run.workflow_run_id,
+        owner_user_id=admitted.run.owner_user_id,
+        expected_stage=admitted.run.stage,
+        expected_stage_version=admitted.run.stage_version,
+        next_stage=WorkflowStage.VALIDATING,
+        next_status=WorkflowRunStatus.ACTIVE,
+        sandbox_attempts=0,
+    )
+    assert active is not None
+    failure_message_id = uuid4()
+    failure_message = WorkflowMessage(
+        message_id=failure_message_id,
+        session_id=active.session_id,
+        author_user_id=None,
+        role="assistant",
+        content="The workflow could not complete. Please review the activity trace.",
+        created_at=NOW + timedelta(seconds=2),
+        client_message_id=failure_message_id,
+    )
+    async with database.open() as connection:
+        await connection.execute(
+            """CREATE TRIGGER fail_completion BEFORE INSERT ON activity_events
+            WHEN NEW.event_type = 'message.completed'
+            BEGIN SELECT RAISE(ABORT, 'fault'); END"""
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="fault"):
+        await store.finalize_failure(
+            run=active,
+            failure_code="workflow_validation_failed",
+            message=failure_message,
+        )
+
+    unchanged = await store.get_run(
+        workflow_run_id=active.workflow_run_id,
+        session_id=active.session_id,
+        owner_user_id=active.owner_user_id,
+    )
+    assert unchanged == active
+    assert await store.list_messages(active.session_id, active.owner_user_id) == [admitted.message]
+
+    async with database.open() as connection:
+        await connection.execute("DROP TRIGGER fail_completion")
+    failed = await store.finalize_failure(
+        run=active,
+        failure_code="workflow_validation_failed",
+        message=failure_message,
+    )
+    replayed = await store.finalize_failure(
+        run=active,
+        failure_code="workflow_validation_failed",
+        message=failure_message,
+    )
+
+    assert failed is not None and failed.status is WorkflowRunStatus.FAILED
+    assert replayed == failed
+    messages = await store.list_messages(active.session_id, active.owner_user_id)
+    assert messages == [admitted.message, failure_message]
+    events = await SQLiteActivityEventStore(database).replay(
+        session_id=active.session_id,
+        owner_user_id=active.owner_user_id,
+        after_event_id=0,
+    )
+    assert [event.event_type.value for event in events] == [
+        "message.accepted",
+        "workflow.stageChanged",
+        "workflow.failed",
+        "message.completed",
+    ]
 
 
 @pytest.mark.asyncio

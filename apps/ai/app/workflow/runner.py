@@ -149,6 +149,24 @@ class WorkflowRunnerStateError(RuntimeError):
     """Durable checkpoints and workflow stage cannot be reconciled safely."""
 
 
+_FAILURE_COMPLETION = "The workflow could not complete. Please review the activity trace."
+
+
+def build_failure_message(run: WorkflowRun, *, created_at: datetime) -> WorkflowMessage:
+    """Build the deterministic, user-safe completion stored for a failed run."""
+
+    message_id = uuid5(run.workflow_run_id, "assistant-failure")
+    return WorkflowMessage(
+        message_id=message_id,
+        session_id=run.session_id,
+        author_user_id=None,
+        role="assistant",
+        content=_FAILURE_COMPLETION,
+        created_at=created_at,
+        client_message_id=message_id,
+    )
+
+
 class LocalInspectionWorkflowInputPolicy:
     """Resolve only selected uploads into AI inputs at the execution boundary."""
 
@@ -263,7 +281,11 @@ class CheckpointAwareWorkflowRunner:
             await self._mark_interrupted(admission)
             raise
         except Exception as error:
-            await self._fail(admission, self._failure_code(error))
+            try:
+                await self._fail(admission, self._failure_code(error))
+            except asyncio.CancelledError:
+                await self._mark_interrupted(admission)
+                raise
 
     async def _run_inspection(self, admission: WorkflowRunAdmission) -> None:
         checkpoint = await self._checkpoints.resolve(admission)
@@ -604,35 +626,10 @@ class CheckpointAwareWorkflowRunner:
                 WorkflowRunStatus.ACTIVE,
             }:
                 return
-            failed = await self._workflows.compare_and_set_stage(
-                session_id=current.session_id,
-                workflow_run_id=current.workflow_run_id,
-                owner_user_id=current.owner_user_id,
-                expected_stage=current.stage,
-                expected_stage_version=current.stage_version,
-                next_stage=WorkflowStage.FAILED,
-                next_status=WorkflowRunStatus.FAILED,
-                sandbox_attempts=current.sandbox_attempts,
-            )
-            if failed is None:
-                return
-            await self._emit_stage_changed(current, failed)
-            if self._events is not None:
-                await self._events.append(
-                    ActivityEvent(
-                        event_id=0,
-                        session_id=failed.session_id,
-                        workflow_run_id=failed.workflow_run_id,
-                        event_type=ActivityEventType.WORKFLOW_FAILED,
-                        occurred_at=failed.updated_at,
-                        payload={"stage": failed.stage.value, "failureCode": failure_code},
-                    ),
-                    owner_user_id=failed.owner_user_id,
-                )
-            await self._persist_assistant(
-                admission,
-                "The workflow could not complete. Please review the activity trace.",
-                completion_key="assistant-failure",
+            await self._workflows.finalize_failure(
+                run=current,
+                failure_code=failure_code,
+                message=build_failure_message(current, created_at=datetime.now(UTC)),
             )
         except Exception:
             return
