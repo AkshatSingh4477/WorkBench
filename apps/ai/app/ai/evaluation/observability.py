@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pydantic import JsonValue
 
 from app.ai.errors import InvalidStructuredOutput
+from app.ai.models.answer_stream import AnswerDelta
 from app.ai.models.ports import ModelAdapter
 from app.ai.models.structured_output import validate_structured_output
 from app.ai.schemas import (
@@ -93,12 +94,15 @@ class ObservedModelAdapter:
         return result
 
     async def generate_conversation(
-        self, request: ConversationGenerationRequest
+        self, request: ConversationGenerationRequest, *, on_delta: AnswerDelta | None = None
     ) -> ConversationGenerationResult:
         """Observe ordinary text chat without retaining conversation content."""
 
         try:
-            result = await self._adapter.generate_conversation(request)
+            if on_delta is None:
+                result = await self._adapter.generate_conversation(request)
+            else:
+                result = await self._adapter.generate_conversation(request, on_delta=on_delta)
         except InvalidStructuredOutput as error:
             self._record_invalid_output(Capability.TEXT, error)
             raise

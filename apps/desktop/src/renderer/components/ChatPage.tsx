@@ -10,6 +10,7 @@ import type {
 import type { ChatThread, ChatThreadId, ChatThreads } from "../hooks/useChatThreads";
 import { Message } from "./Message";
 import { SessionStageStrip } from "./SessionStageStrip";
+import { ToolActivity } from "./ToolActivity";
 import { Button } from "./ui/button";
 import { Label } from "./ui/label";
 import { Textarea } from "./ui/textarea";
@@ -127,7 +128,7 @@ function ChatComposer({ canSend, disabledReason, draft, isSelecting, isSending, 
         id="chat-draft"
         onChange={(event) => onDraftChange(event.target.value)}
         onKeyDown={(event) => {
-          if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+          if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
             event.preventDefault();
             send();
           }
@@ -393,6 +394,7 @@ export function ChatPage({
             {thread.workflowState === "awaitingApproval" ? " — Approve/Reject actions will be available in Phase 5." : ""}
           </p>
         )}
+        <ToolActivity events={thread.activityEvents} />
         <ChatComposer
           canSend={canSend}
           disabledReason={sendDisabledReason}
