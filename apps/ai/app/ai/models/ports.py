@@ -2,7 +2,6 @@
 
 from typing import Protocol
 
-from app.ai.models.answer_stream import AnswerDelta
 from app.ai.schemas import (
     ConversationGenerationRequest,
     ConversationGenerationResult,
@@ -37,7 +36,7 @@ class ModelAdapter(Protocol):
         ...
 
     async def generate_conversation(
-        self, request: ConversationGenerationRequest, *, on_delta: AnswerDelta | None = None
+        self, request: ConversationGenerationRequest
     ) -> ConversationGenerationResult:
         """Run one bounded free-text local conversation turn."""
         ...

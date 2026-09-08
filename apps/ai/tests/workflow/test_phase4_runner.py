@@ -9,8 +9,7 @@ from uuid import uuid4
 
 import pytest
 
-from app.ai.fakes import FakeAIEngine, FakeModelAdapter
-from app.ai.models.profiles import load_model_profile
+from app.ai.fakes import FakeAIEngine
 from app.ai.schemas import (
     AgentContext,
     AgentProposal,
@@ -493,8 +492,6 @@ async def test_restart_recovery_resumes_the_original_durable_user_message(
 
     class CapturingRecoveryEngine:
         def __init__(self) -> None:
-            self.model_adapter = FakeModelAdapter()
-            self.model_profile = load_model_profile()
             self.summaries: list[str] = []
 
         async def choose_capability(self, task: TaskDescriptor) -> CapabilityDecision:

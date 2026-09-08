@@ -9,7 +9,6 @@ import { CommandPalette } from "./components/CommandPalette";
 import { ChatPage } from "./components/ChatPage";
 import { LoginScreen } from "./components/LoginScreen";
 import { QwenChatPage } from "./components/QwenChatPage";
-import { PdfChatPage } from "./components/PdfChatPage";
 import { WindowTitleBar } from "./components/WindowTitleBar";
 import { SettingsPage, type HealthState } from "./components/SettingsPage";
 import { WorkspaceSidebar } from "./components/WorkspaceSidebar";
@@ -92,7 +91,6 @@ function Workspace({
     access.kind === "authenticated" ? defaultEmployeeWorkspaceView : "chat",
   );
   const [accountOpen, setAccountOpen] = useState(false);
-  const [pdfMode, setPdfMode] = useState(false);
   const [healthState, setHealthState] = useState<HealthState>({ kind: "loading" });
   const [now, setNow] = useState(() => Date.now());
   const chatThreads = useChatThreads({
@@ -204,10 +202,10 @@ function Workspace({
         localChatsState={qwenChat.state.pickerState}
         activeLocalChatId={qwenChat.state.sessionId}
         onCreateChat={chatThreads.createChat}
-        onCreateLocalChat={() => {setPdfMode(false); qwenChat.startNewConversation();}}
+        onCreateLocalChat={qwenChat.startNewConversation}
         onNavigate={handleNavigate}
         onSelectChat={chatThreads.selectChat}
-        onSelectLocalChat={(id) => {setPdfMode(false); qwenChat.selectSession(id);}}
+        onSelectLocalChat={qwenChat.selectSession}
         onRetryChats={chatThreads.refreshSessions}
         onRetryLocalChats={qwenChat.refreshSessions}
         onSettingsSectionChange={onSettingsSectionChange}
@@ -261,8 +259,7 @@ function Workspace({
             selectedSection={settingsSection}
           />
         ) : activeView === "qwenChat" ? (
-          pdfMode ? <PdfChatPage onLocalChat={() => setPdfMode(false)} /> :
-          <QwenChatPage chat={qwenChat} connected={access.kind === "authenticated"} onPdf={() => setPdfMode(true)} />
+          <QwenChatPage chat={qwenChat} connected={access.kind === "authenticated"} />
         ) : (
           <ChatPage
             backendConnected={access.kind === "authenticated"}

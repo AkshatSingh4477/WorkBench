@@ -14,13 +14,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from starlette.middleware.base import RequestResponseEndpoint
 
-from app.ai.knowledge.chroma_ingestion import create_persistent_chroma_client
 from app.ai.local_engine import create_local_ai_engine
 from app.api.auth import build_auth_router, clear_session_cookie
 from app.api.chat import build_chat_router
 from app.api.contracts import ErrorResponse
 from app.api.health_contracts import HealthResponse, HealthStatus
-from app.api.pdf import build_pdf_router
 from app.api.sessions import build_session_router
 from app.api.workflow_messages import build_workflow_message_router
 from app.artifacts import LibreOfficePdfConverter, LocalDocumentArtifactExecutor
@@ -28,10 +26,6 @@ from app.auth.service import AuthError, AuthService
 from app.config import ApplicationSettings
 from app.health import ApplicationDependencies, build_health_response
 from app.local_health import LocalSystemHealthProvider
-from app.pdf.engine import PdfDocumentError
-from app.pdf.index import PdfIndex
-from app.pdf.service import PdfWorkflowService
-from app.pdf.store import PdfStateStore
 from app.ports.local_backend import LocalDeploymentProof
 from app.sandbox import DockerSandboxExecutor
 from app.storage import (
@@ -142,24 +136,7 @@ def compose_runtime_dependencies(
         ),
     )
     sandbox_executor = DockerSandboxExecutor(database, files, settings)
-    chroma_client = create_persistent_chroma_client(knowledge.approved_knowledge_root())
-    ai_engine = create_local_ai_engine(
-        knowledge_root=knowledge.approved_knowledge_root(), chroma_client=chroma_client
-    )
-    pdf_store = PdfStateStore(database)
-    pdf_service = PdfWorkflowService(
-        store=pdf_store,
-        files=files,
-        workspaces=workspaces,
-        models=ai_engine.model_adapter,
-        profile=ai_engine.model_profile,
-        ai=ai_engine,
-        index=PdfIndex(
-            chroma_client,
-            ai_engine.model_adapter,
-            ai_engine.model_profile,
-        ),
-    )
+    ai_engine = create_local_ai_engine(knowledge_root=knowledge.approved_knowledge_root())
     tool_registry = ToolRegistry(approvals, artifact_executor, sandbox_executor)
     input_policy = workflow_input_policy or LocalInspectionWorkflowInputPolicy(files)
     workflow_runner = CheckpointAwareWorkflowRunner(
@@ -196,7 +173,6 @@ def compose_runtime_dependencies(
 
     async def _startup_with_recovery() -> None:
         await database.initialize()
-        await pdf_store.initialize()
         now = datetime.now(UTC)
         await workflow_store.mark_stale_runs_interrupted(
             stale_before=now - timedelta(seconds=settings.workflow_lease_seconds),
@@ -242,7 +218,6 @@ def compose_runtime_dependencies(
         await ai_engine.close()
 
     return ApplicationDependencies(
-        pdf_service=pdf_service,
         ai_engine=ai_engine,
         system_health_provider=LocalSystemHealthProvider(database, settings),
         identity_store=SQLiteIdentityStore(database),
@@ -356,7 +331,6 @@ def create_app(
     )
     application.state.chat_store = resolved_dependencies.chat_store
     application.state.ai_engine = resolved_dependencies.ai_engine
-    application.state.pdf_service = resolved_dependencies.pdf_service
     application.state.workflow_store = resolved_dependencies.workflow_store
     application.state.session_file_store = resolved_dependencies.session_file_store
     application.state.activity_event_store = resolved_dependencies.activity_event_store
@@ -366,33 +340,11 @@ def create_app(
     application.add_exception_handler(RequestValidationError, _validation_error_handler)
     application.add_exception_handler(AuthError, _auth_error_handler)
     application.add_exception_handler(Exception, _unhandled_error_handler)
-
-    async def pdf_error(request: Request, error: Exception) -> JSONResponse:
-        del request
-        return JSONResponse(
-            status_code=422, content={"code": "pdf_request_failed", "message": str(error)}
-        )
-
-    application.add_exception_handler(PdfDocumentError, pdf_error)
-
-    async def pdf_access_error(request: Request, error: Exception) -> JSONResponse:
-        if request.url.path.startswith("/pdf/"):
-            return JSONResponse(
-                status_code=404,
-                content={
-                    "code": "pdf_not_found",
-                    "message": "PDF session, source or artifact not found for this employee.",
-                },
-            )
-        return await _unhandled_error_handler(request, error)
-
-    application.add_exception_handler(PermissionError, pdf_access_error)
     application.include_router(_health_router(resolved_settings, resolved_dependencies))
     application.include_router(build_auth_router(resolved_settings))
     application.include_router(build_session_router())
     application.include_router(build_workflow_message_router())
     application.include_router(build_chat_router())
-    application.include_router(build_pdf_router())
     return application
 
 

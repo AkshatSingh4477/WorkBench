@@ -9,12 +9,11 @@ import { Label } from "./ui/label";
 import { Textarea } from "./ui/textarea";
 
 type QwenChatPageProps = {
-  onPdf?: () => void;
   chat: QwenChat;
   connected: boolean;
 };
 
-export function QwenChatPage({ chat, connected, onPdf }: QwenChatPageProps) {
+export function QwenChatPage({ chat, connected }: QwenChatPageProps) {
   const { state } = chat;
   const listRef = useRef<HTMLDivElement>(null);
   const messageCount = state.messages.length;
@@ -43,7 +42,6 @@ export function QwenChatPage({ chat, connected, onPdf }: QwenChatPageProps) {
     <section className="grid min-h-0 flex-1 grid-rows-[auto_minmax(0,1fr)_auto] px-8 pb-16 pt-10">
       <header className="mx-auto w-full max-w-3xl">
         <h1 className="text-lg font-medium tracking-tight text-foreground">Local Qwen chat</h1>
-        {onPdf && <Button type="button" variant="outline" onClick={onPdf}>PDF · Attach or create a document</Button>}
         <p className="mt-1 text-sm leading-6 text-muted-foreground">
           Plain multi-turn conversation with the local Qwen text model. Documents, tools, and workflow steps are not
           used in this mode.
@@ -68,8 +66,6 @@ export function QwenChatPage({ chat, connected, onPdf }: QwenChatPageProps) {
               Waiting for the local model…
             </p>
           )}
-          {isSending && state.provisionalAnswer && <p className="whitespace-pre-wrap text-sm">{state.provisionalAnswer}</p>}
-          {isSending && <Button variant="outline" onClick={chat.cancel}>Cancel generation</Button>}
           {state.messagesState === "loading" && (
             <p className="text-sm text-muted-foreground" role="status">Loading messages…</p>
           )}
@@ -95,7 +91,7 @@ export function QwenChatPage({ chat, connected, onPdf }: QwenChatPageProps) {
             maxLength={conversationMessageMaxLength}
             onChange={(event) => chat.setDraft(event.target.value)}
             onKeyDown={(event) => {
-              if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+              if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
                 event.preventDefault();
                 send();
               }
