@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ChatMessage, ChatSession, LocalServiceRequest, LocalServiceResponse } from "../src/shared/contracts.ts";
+import {
+  localGenerationRequestTimeoutMs,
+  minGenerationRequestTimeoutMs,
+  rendererGenerationRequestTimeoutMs,
+} from "../src/shared/contracts.ts";
 import { LocalApiError, apiFailureWasDefinitive, localApi } from "../src/renderer/api/localApi.ts";
 
 interface StubBridge {
@@ -78,30 +83,12 @@ const messagePayload = {
   clientMessageId: "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
 };
 
+/** The Phase 4 workflow-admission acknowledgement is not the chat append response. */
 const queuedWorkAckPayload = {
   messageId: messagePayload.messageId,
   workflowRunId: "3ef46b0e-7c1a-4d9e-9f2a-3f5c6b7d8e92",
   status: "queued",
   eventsUrl: `/sessions/${sessionPayload.sessionId}/events`,
-};
-
-const conversationPayload = {
-  sessionId: sessionPayload.sessionId,
-  userMessageId: messagePayload.messageId,
-  assistantMessageId: "9ef46b0e-7c1a-4d9e-9f2a-3f5c6b7d8e97",
-  assistantText: "I am the approved local Qwen model.",
-  selectedModel: "qwen3:4b",
-  usedFallback: false,
-  fallbackReason: null,
-  metrics: {
-    clientElapsedMs: 125.5,
-    totalDurationNs: null,
-    loadDurationNs: null,
-    promptEvalCount: 12,
-    promptEvalDurationNs: null,
-    evalCount: 9,
-    evalDurationNs: null,
-  },
 };
 
 test("current FastAPI ready health responses parse into the canonical contract", async () => {
@@ -279,58 +266,15 @@ test("malformed chat payloads are rejected instead of trusted", async () => {
   }
 });
 
-test("append responses are validated as Phase 4 queued-work acknowledgements", async () => {
+test("append responses are validated as stored chat messages, not queued-work acks", async () => {
   installBridge({ requestLocalService: async () => ok(queuedWorkAckPayload) });
-  const acknowledgement = await localApi.appendChatMessage(sessionPayload.sessionId, {
-    content: "Find the corrosion findings.",
-    clientMessageId: "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
-    selectedUploadIds: [],
-  });
-  assert.equal(acknowledgement.workflowRunId, queuedWorkAckPayload.workflowRunId);
-  assert.equal(acknowledgement.status, "queued");
-});
-
-test("ordinary conversation responses use the distinct text-only operation", async () => {
-  let observed: LocalServiceRequest | undefined;
-  installBridge({
-    requestLocalService: async (request) => {
-      observed = request;
-      return ok(conversationPayload);
-    },
-  });
-
-  const response = await localApi.createConversationTurn(sessionPayload.sessionId, {
-    message: "Hello, what model is this?",
-    clientRequestId: messagePayload.clientMessageId,
-  });
-
-  assert.equal(response.selectedModel, "qwen3:4b");
-  assert.equal(response.assistantText, conversationPayload.assistantText);
-  assert.deepEqual(observed, {
-    operation: "chatCreateConversation",
-    sessionId: sessionPayload.sessionId,
-    request: {
-      message: "Hello, what model is this?",
-      clientRequestId: messagePayload.clientMessageId,
-    },
-  });
-});
-
-test("ordinary conversation error codes remain available for actionable UI messages", async () => {
-  installBridge({
-    requestLocalService: async () => ({
-      status: 503,
-      body: JSON.stringify({ code: "ollama_unavailable", message: "The local Ollama service is unavailable." }),
-    }),
-  });
-
   await assert.rejects(
-    localApi.createConversationTurn(sessionPayload.sessionId, { message: "Hello" }),
-    (error: unknown) =>
-      error instanceof LocalApiError &&
-      error.kind === "http" &&
-      error.status === 503 &&
-      error.code === "ollama_unavailable",
+    localApi.appendChatMessage(sessionPayload.sessionId, {
+      content: "Find the corrosion findings.",
+      clientMessageId: "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
+      selectedUploadIds: [],
+    }),
+    (error: unknown) => error instanceof LocalApiError && error.kind === "invalidResponse",
   );
 });
 
@@ -381,7 +325,7 @@ test("create and append round-trip the request bodies to the local service", asy
       if (request.operation === "chatCreateSession") {
         return ok(sessionPayload);
       }
-      return ok(request.operation === "chatAppendMessage" ? queuedWorkAckPayload : messagePayload);
+      return ok(messagePayload);
     },
   });
 
@@ -390,14 +334,15 @@ test("create and append round-trip the request bodies to the local service", asy
     title: "Inspection review",
     clientSessionId: "4ef46b0e-7c1a-4d9e-9f2a-3f5c6b7d8e92",
   });
-  const admitted = await localApi.appendChatMessage(sessionPayload.sessionId, {
+  const appended = await localApi.appendChatMessage(sessionPayload.sessionId, {
     content: "Find the corrosion findings.",
     clientMessageId: "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
     selectedUploadIds: ["5ef46b0e-7c1a-4d9e-9f2a-3f5c6b7d8e93"],
   });
   assert.equal(created.sessionId, sessionPayload.sessionId);
-  assert.equal(admitted.messageId, queuedWorkAckPayload.messageId);
-  assert.equal(admitted.workflowRunId, queuedWorkAckPayload.workflowRunId);
+  assert.equal(appended.messageId, messagePayload.messageId);
+  assert.equal(appended.role, "user");
+  assert.equal(appended.clientMessageId, messagePayload.clientMessageId);
   assert.deepEqual(requests[0], {
     operation: "chatCreateSession",
     request: {
@@ -435,4 +380,118 @@ test("workflow uploads use only Electron-issued opaque selection tokens", async 
   const uploaded = await localApi.uploadWorkflowFile(sessionPayload.sessionId, uploadToken);
   assert.equal(uploaded.fileName, "report.pdf");
   assert.deepEqual(observed, { operation: "workflowUpload", sessionId: sessionPayload.sessionId, uploadToken });
+});
+
+const conversationPayload = {
+  sessionId: sessionPayload.sessionId,
+  userMessageId: "9ef46b0e-7c1a-4d9e-9f2a-3f5c6b7d8e97",
+  assistantMessageId: "aef46b0e-7c1a-4d9e-9f2a-3f5c6b7d8e98",
+  assistantText: "Local Qwen reply.",
+  selectedModel: "qwen3:4b",
+  usedFallback: false,
+  fallbackReason: null,
+  metrics: {
+    clientElapsedMs: 12.5,
+    totalDurationNs: 1_000_000,
+    loadDurationNs: null,
+    promptEvalCount: 12,
+    promptEvalDurationNs: 3_000_000,
+    evalCount: 9,
+    evalDurationNs: 4_000_000,
+  },
+};
+
+test("generation requests use dedicated timeouts that outlive local inference", () => {
+  assert.equal(minGenerationRequestTimeoutMs, 120_000);
+  assert.equal(localGenerationRequestTimeoutMs, 180_000);
+  assert.equal(rendererGenerationRequestTimeoutMs, localGenerationRequestTimeoutMs + 10_000);
+});
+
+test("conversation turns round-trip the request and parse the reply contract", async () => {
+  const observed: LocalServiceRequest[] = [];
+  installBridge({
+    requestLocalService: async (request) => {
+      observed.push(request);
+      return ok(conversationPayload);
+    },
+  });
+
+  const turn = await localApi.sendConversationMessage(sessionPayload.sessionId, {
+    message: "Follow-up question",
+    clientRequestId: "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
+  });
+
+  assert.equal(turn.sessionId, sessionPayload.sessionId);
+  assert.equal(turn.assistantText, "Local Qwen reply.");
+  assert.equal(turn.selectedModel, "qwen3:4b");
+  assert.equal(turn.usedFallback, false);
+  assert.equal(turn.fallbackReason, null);
+  assert.equal(turn.metrics?.promptEvalCount, 12);
+  assert.deepEqual(observed, [
+    {
+      operation: "conversationCreate",
+      sessionId: sessionPayload.sessionId,
+      request: { message: "Follow-up question", clientRequestId: "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d" },
+    },
+  ]);
+});
+
+test("malformed conversation replies are rejected instead of trusted", async () => {
+  const invalidReplies: unknown[] = [
+    {},
+    { ...conversationPayload, sessionId: "not-a-uuid" },
+    { ...conversationPayload, assistantText: "" },
+    { ...conversationPayload, selectedModel: "" },
+    { ...conversationPayload, selectedModel: "bad model id with spaces" },
+    { ...conversationPayload, selectedModel: "https://evil.example.com/model" },
+    { ...conversationPayload, selectedModel: "x".repeat(101) },
+    { ...conversationPayload, usedFallback: "no" },
+    { ...conversationPayload, fallbackReason: "x".repeat(501) },
+    { ...conversationPayload, fallbackReason: 42 },
+    { ...conversationPayload, metrics: { ...conversationPayload.metrics, clientElapsedMs: -1 } },
+    { ...conversationPayload, metrics: { ...conversationPayload.metrics, evalCount: 1.5 } },
+    { ...conversationPayload, userMessageId: undefined },
+    { ...conversationPayload, unexpectedField: "rejected" },
+  ];
+  for (const payload of invalidReplies) {
+    installBridge({ requestLocalService: async () => ok(payload) });
+    await assert.rejects(
+      localApi.sendConversationMessage(sessionPayload.sessionId, { message: "Follow-up question" }),
+      (error: unknown) => error instanceof Error && error.name === "LocalApiError",
+    );
+  }
+});
+
+test("conversation failure codes are attached for safe, actionable mapping", async () => {
+  const cases: ReadonlyArray<[number, string, string]> = [
+    [503, "text_model_unavailable", "sensitive model detail"],
+    [503, "ollama_unavailable", "http://10.0.0.1:11434 refused"],
+    [504, "generation_timeout", "stack trace"],
+    [413, "conversation_too_large", "token count"],
+    [409, "conversation_conflict", "conflict detail"],
+    [409, "session_not_active", "closed detail"],
+  ];
+  for (const [status, code, backendMessage] of cases) {
+    installBridge({
+      requestLocalService: async () => ({ status, body: JSON.stringify({ code, message: backendMessage }) }),
+    });
+    await assert.rejects(
+      localApi.sendConversationMessage(sessionPayload.sessionId, { message: "Follow-up question" }),
+      (error: unknown) =>
+        error instanceof LocalApiError && error.kind === "http" && error.status === status && error.errorCode === code,
+    );
+  }
+});
+
+test("conversation 404s keep the resource-not-found distinction", async () => {
+  installBridge({
+    requestLocalService: async () => ({
+      status: 404,
+      body: JSON.stringify({ code: "session_not_found", message: "The chat session was not found for this employee." }),
+    }),
+  });
+  await assert.rejects(
+    localApi.sendConversationMessage(sessionPayload.sessionId, { message: "Follow-up question" }),
+    (error: unknown) => error instanceof LocalApiError && error.kind === "resourceNotFound" && error.status === 404,
+  );
 });

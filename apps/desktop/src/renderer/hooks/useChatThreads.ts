@@ -42,12 +42,6 @@ function sendFailureMessage(error: unknown): string {
     if (error.kind === "unauthorized") return "Your local employee session could not be verified. Sign in again.";
     if (error.kind === "timeout") return "The local service timed out. Delivery is unconfirmed; sending again reuses the same request and cannot duplicate it.";
     if (error.kind === "network") return "FastAPI is unavailable. Delivery is unconfirmed; sending again reuses the same request and cannot duplicate it.";
-    if (error.code === "ollama_unavailable") return "Ollama is unavailable at 127.0.0.1:11434. Start Ollama and try again.";
-    if (error.code === "text_model_unavailable") return "No approved local text model is available. Load qwen3:4b or the approved fallback and try again.";
-    if (error.code === "generation_timeout") return "The local text model timed out before completing a response. Try again.";
-    if (error.code === "invalid_ai_response") return "The local text model returned an invalid response. Try again.";
-    if (error.code === "conversation_too_large") return "This conversation is too large for the selected local model. Start a new chat.";
-    if (error.code === "conversation_conflict") return "Another message updated this chat. Refresh the thread and try again.";
     if (error.kind === "http" && error.status === 409) return "This chat session is closed and no longer accepts messages.";
     return error.message;
   }
@@ -158,7 +152,7 @@ export function useChatThreads({ apiBaseUrl, connected, examplesEnabled }: ChatT
       const unsubscribe = window.workbench.subscribeSessionEvents(sessionId, afterEventId, (update) => {
         if (update.type === "event") {
           dispatch({ type: "workflowEvent", threadId, event: update.event });
-          if (update.event.eventType === "message.accepted" || update.event.eventType === "message.completed" || update.event.eventType === "workflow.failed") {
+          if (update.event.eventType === "message.completed" || update.event.eventType === "workflow.failed") {
             void localApi.listChatMessages(sessionId, apiBaseUrl).then(
               (response) => dispatch({ type: "messagesLoaded", threadId, messages: response.messages }),
               () => undefined,
@@ -282,37 +276,26 @@ export function useChatThreads({ apiBaseUrl, connected, examplesEnabled }: ChatT
             dispatch({ type: "sessionBound", threadId, session: created });
             sessionId = created.sessionId;
           }
-          await localApi.createConversationTurn(
+          const selectedFiles = [
+            ...Object.values(thread.inspectionFiles).filter((file): file is SelectedUploadFile => file !== undefined),
+            ...thread.attachments,
+          ];
+          const uploadedIdsByToken = { ...thread.uploadedIdsByToken };
+          for (const file of selectedFiles) {
+            if (uploadedIdsByToken[file.uploadToken]) continue;
+            const uploaded = await localApi.uploadWorkflowFile(sessionId, file.uploadToken);
+            uploadedIdsByToken[file.uploadToken] = uploaded.uploadId;
+            dispatch({ type: "uploadRegistered", threadId, uploadToken: file.uploadToken, uploadId: uploaded.uploadId });
+          }
+          const message = await localApi.appendChatMessage(
             sessionId,
-            { message: content, clientRequestId: clientMessageId },
+            { content, clientMessageId, selectedUploadIds: selectedFiles.map((file) => uploadedIdsByToken[file.uploadToken]!) },
             apiBaseUrl,
           );
           if (sendSequencesRef.current.get(threadId) !== requestSequence) return;
-          dispatch({ type: "sendResolved", threadId, now: Date.now() });
+          dispatch({ type: "messageAppended", threadId, message, now: Date.now() });
+          dispatch({ type: "workflowQueued", threadId });
           dispatch({ type: "draftClearedIfUnchanged", threadId, draft: submittedDraft, now: Date.now() });
-
-          // The backend response confirms the complete turn, but SQLite is the
-          // canonical message source. Reload it instead of constructing local
-          // user/assistant messages from the response body.
-          const messageRequestSequence = (messageSequencesRef.current.get(threadId) ?? 0) + 1;
-          messageSequencesRef.current.set(threadId, messageRequestSequence);
-          dispatch({ type: "messagesLoading", threadId });
-          try {
-            const stored = await localApi.listChatMessages(sessionId, apiBaseUrl);
-            if (
-              sendSequencesRef.current.get(threadId) === requestSequence &&
-              messageSequencesRef.current.get(threadId) === messageRequestSequence
-            ) {
-              dispatch({ type: "messagesLoaded", threadId, messages: stored.messages });
-            }
-          } catch {
-            if (
-              sendSequencesRef.current.get(threadId) === requestSequence &&
-              messageSequencesRef.current.get(threadId) === messageRequestSequence
-            ) {
-              dispatch({ type: "messagesFailed", threadId });
-            }
-          }
         } catch (error) {
           if (sendSequencesRef.current.get(threadId) !== requestSequence) return;
           // Release the keys only when the outcome is certain: FastAPI

@@ -13,6 +13,20 @@ export const IPC_CHANNELS = {
 /** The only FastAPI origin the desktop client may contact. */
 export const LOCAL_API_ORIGIN = "http://127.0.0.1:8000";
 
+/**
+ * Generation-specific IPC watchdogs. Local text generation can legitimately
+ * run for minutes on Jetson-class hardware, while health, auth, and session
+ * traffic keep the short general timeout.
+ */
+export const minGenerationRequestTimeoutMs = 120_000;
+/** Watchdog the Electron main process applies to generation requests. */
+export const localGenerationRequestTimeoutMs = 180_000;
+/**
+ * The renderer race must outlive the main-process watchdog so a slow local
+ * reply surfaces as an error instead of being silently dropped.
+ */
+export const rendererGenerationRequestTimeoutMs = 190_000;
+
 export type IpcChannel = (typeof IPC_CHANNELS)[keyof typeof IPC_CHANNELS];
 
 export type LocalServiceMode = "attached" | "managed";
@@ -100,8 +114,8 @@ export type LocalServiceRequest =
   | { operation: "chatCreateSession"; request: ChatSessionCreateRequest }
   | { operation: "chatGetSession"; sessionId: string }
   | { operation: "chatListMessages"; sessionId: string }
-  | { operation: "chatCreateConversation"; sessionId: string; request: ConversationCreateRequest }
   | { operation: "chatAppendMessage"; sessionId: string; request: ChatMessageAppendRequest }
+  | { operation: "conversationCreate"; sessionId: string; request: ConversationCreateRequest }
   | { operation: "workflowUpload"; sessionId: string; uploadToken: string };
 
 export interface LocalServiceResponse {
@@ -259,7 +273,8 @@ export interface WorkflowUploadProgress {
 
 /** Wire contracts mirroring the local FastAPI chat surface. FastAPI serializes camelCase. */
 
-export const chatWorkflowTypeSchema = z.enum(["inspectionAnalysis", "codeRepair"]);
+/** Session kinds; "localConversation" backs plain chat and never runs workflows. */
+export const chatWorkflowTypeSchema = z.enum(["inspectionAnalysis", "codeRepair", "localConversation"]);
 
 export const chatStageSchema = z.enum([
   "collectingInputs",
@@ -355,19 +370,22 @@ export const workflowUploadResponseSchema = z.strictObject({
   createdAt: chatTimestampSchema,
 });
 
-/** Text-only chat request. Workflow inputs and tool fields are intentionally absent. */
+/** One text-only local conversation turn; workflow and retrieval fields are rejected. */
+export const conversationMessageMaxLength = 20_000;
+
 export const conversationCreateRequestSchema = z.strictObject({
   message: z
     .string()
     .min(1)
-    .max(20_000)
+    .max(conversationMessageMaxLength)
     .refine((message) => message.trim().length > 0, { message: "message must not be blank" }),
-  /** Stable per-attempt idempotency key; retries reuse it instead of duplicating a turn. */
+  /** Stable per-attempt idempotency key so an unconfirmed turn can be reconciled. */
   clientRequestId: uuidSchema.optional(),
 });
 
-export const inferenceMetricsSchema = z.strictObject({
-  clientElapsedMs: z.number().nonnegative(),
+/** Non-confidential timing and token counts reported with a completed turn. */
+export const conversationMetricsSchema = z.strictObject({
+  clientElapsedMs: z.number().min(0),
   totalDurationNs: z.number().int().nonnegative().nullable(),
   loadDurationNs: z.number().int().nonnegative().nullable(),
   promptEvalCount: z.number().int().nonnegative().nullable(),
@@ -376,24 +394,21 @@ export const inferenceMetricsSchema = z.strictObject({
   evalDurationNs: z.number().int().nonnegative().nullable(),
 });
 
-/** One complete local conversation turn after both messages have been persisted. */
+/** One persisted conversation turn plus the safe local-model facts to display. */
 export const conversationCreateResponseSchema = z.strictObject({
   sessionId: uuidSchema,
   userMessageId: uuidSchema,
   assistantMessageId: uuidSchema,
   assistantText: z.string().min(1).max(20_000),
-  selectedModel: z.string().min(1),
+  /** Bounded model-identifier shape; malformed values fail parsing, not rendering. */
+  selectedModel: z
+    .string()
+    .min(1)
+    .max(100)
+    .regex(/^[A-Za-z0-9][A-Za-z0-9._:-]*$/),
   usedFallback: z.boolean(),
-  fallbackReason: z.string().nullable(),
-  metrics: inferenceMetricsSchema.nullable(),
-});
-
-/** Durable Phase 4 workflow admission; completion arrives through session events. */
-export const workflowMessageAcceptedResponseSchema = z.strictObject({
-  messageId: uuidSchema,
-  workflowRunId: uuidSchema,
-  status: z.literal("queued"),
-  eventsUrl: z.string().regex(/^\/sessions\/[0-9a-f-]{36}\/events$/),
+  fallbackReason: z.string().max(500).nullable(),
+  metrics: conversationMetricsSchema.nullable(),
 });
 
 export const activityEventTypeSchema = z.enum([
@@ -428,16 +443,7 @@ export type SessionEventStreamUpdate =
 /** The renderer may build paths only from server-issued session IDs. */
 export const chatSessionIdSchema = uuidSchema;
 
-export const chatErrorCodeSchema = z.enum([
-  "session_not_found",
-  "session_not_active",
-  "conversation_conflict",
-  "conversation_too_large",
-  "generation_timeout",
-  "invalid_ai_response",
-  "ollama_unavailable",
-  "text_model_unavailable",
-]);
+export const chatErrorCodeSchema = z.enum(["session_not_found"]);
 
 export type ChatWorkflowType = z.infer<typeof chatWorkflowTypeSchema>;
 
@@ -458,9 +464,8 @@ export type ChatMessageListResponse = z.infer<typeof chatMessageListResponseSche
 export type ChatSessionCreateRequest = z.infer<typeof chatSessionCreateRequestSchema>;
 
 export type ChatMessageAppendRequest = z.infer<typeof chatMessageAppendRequestSchema>;
-export type ConversationCreateRequest = z.infer<typeof conversationCreateRequestSchema>;
-export type ConversationCreateResponse = z.infer<typeof conversationCreateResponseSchema>;
-export type ChatErrorCode = z.infer<typeof chatErrorCodeSchema>;
 export type WorkflowUploadResponse = z.infer<typeof workflowUploadResponseSchema>;
-export type WorkflowMessageAcceptedResponse = z.infer<typeof workflowMessageAcceptedResponseSchema>;
+export type ConversationCreateRequest = z.infer<typeof conversationCreateRequestSchema>;
+export type ConversationMetrics = z.infer<typeof conversationMetricsSchema>;
+export type ConversationCreateResponse = z.infer<typeof conversationCreateResponseSchema>;
 export type SessionActivityEvent = z.infer<typeof sessionActivityEventSchema>;
