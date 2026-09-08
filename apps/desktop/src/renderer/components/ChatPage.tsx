@@ -9,7 +9,6 @@ import type {
 } from "../../shared/contracts";
 import type { ChatThread, ChatThreadId, ChatThreads } from "../hooks/useChatThreads";
 import { Message } from "./Message";
-import { SessionStageStrip } from "./SessionStageStrip";
 import { Button } from "./ui/button";
 import { Label } from "./ui/label";
 import { Textarea } from "./ui/textarea";
@@ -107,14 +106,13 @@ type ChatComposerProps = {
   canSend: boolean;
   disabledReason?: string;
   draft: string;
-  isSelecting: boolean;
   isSending: boolean;
   onDraftChange: (draft: string) => void;
   onSend: () => void;
   onSelectAttachments: () => void;
 };
 
-function ChatComposer({ canSend, disabledReason, draft, isSelecting, isSending, onDraftChange, onSend, onSelectAttachments }: ChatComposerProps) {
+function ChatComposer({ canSend, disabledReason, draft, isSending, onDraftChange, onSend, onSelectAttachments }: ChatComposerProps) {
   const send = useCallback(() => {
     if (canSend && !isSending) onSend();
   }, [canSend, isSending, onSend]);
@@ -137,10 +135,11 @@ function ChatComposer({ canSend, disabledReason, draft, isSelecting, isSending, 
       />
       <div className="absolute bottom-1.5 right-2 flex items-center gap-1">
         <Button
-          aria-label="Attach files"
-          disabled={isSelecting}
+          aria-label="Attachments are not available in basic chat"
+          disabled
           onClick={onSelectAttachments}
           size="icon"
+          title="Attachments are not available in basic chat."
           type="button"
           variant="ghost"
         >
@@ -315,14 +314,16 @@ export function ChatPage({
   const isExampleThread = examplesEnabled && thread.source === "example";
   const isSending = thread.sendState === "sending";
   const sessionClosed = thread.status !== undefined && thread.status !== "active";
-  const canSend = backendConnected && !sessionClosed && draft.trim().length > 0 && !isSending;
+  const canSend = backendConnected && !sessionClosed && !hasFiles && draft.trim().length > 0 && !isSending;
   const sendDisabledReason = !backendConnected
     ? "Sending requires a local employee sign-in."
     : sessionClosed
       ? "This chat session is closed."
-      : draft.trim().length === 0
-        ? "Write a message first."
-        : undefined;
+      : hasFiles
+        ? "Remove selected files before sending a basic text chat."
+        : draft.trim().length === 0
+          ? "Write a message first."
+          : undefined;
 
   const showMessagesView = isBoundThread || thread.messages.length > 0;
 
@@ -349,12 +350,12 @@ export function ChatPage({
           <section aria-labelledby="chat-heading" className="flex min-h-full items-center justify-center pb-4">
             <div className={`w-full ${hasFiles ? "max-w-xl" : "max-w-md text-center"}`}>
               <h1 id="chat-heading" className="text-lg font-medium tracking-tight text-foreground">
-                {hasFiles ? "Selected files" : "Start an inspection review"}
+                {hasFiles ? "Selected files" : "Start a local chat"}
               </h1>
               <p className="mt-2 text-sm leading-6 text-muted-foreground">
                 {hasFiles
-                  ? "These files will be uploaded to this local workflow session when you send your message."
-                  : "Select an inspection report and site photograph, or attach supporting files for local analysis."}
+                  ? "Remove these files to continue. Uploads and workflow actions are not available in basic chat."
+                  : "Ask a question and receive a complete response from the approved local text model."}
               </p>
               {hasFiles && (
                 <ul aria-label="Selected files" className="mt-5 divide-y divide-border overflow-hidden rounded-lg border border-border bg-muted/30">
@@ -373,8 +374,8 @@ export function ChatPage({
                 </ul>
               )}
               <div className={`flex flex-wrap gap-3 ${hasFiles ? "mt-4" : "mt-6 justify-center"}`}>
-                {!inspectionFiles.inspectionReport && <Button disabled={selecting} onClick={() => void selectInspectionFile("inspectionReport")} type="button">Select inspection report</Button>}
-                {!inspectionFiles.sitePhotograph && <Button disabled={selecting} onClick={() => void selectInspectionFile("sitePhotograph")} type="button" variant={hasFiles ? "outline" : "default"}>Select site photograph</Button>}
+                {!inspectionFiles.inspectionReport && <Button disabled onClick={() => void selectInspectionFile("inspectionReport")} title="Uploads are not available in basic chat." type="button">Select inspection report</Button>}
+                {!inspectionFiles.sitePhotograph && <Button disabled onClick={() => void selectInspectionFile("sitePhotograph")} title="Uploads are not available in basic chat." type="button" variant={hasFiles ? "outline" : "default"}>Select site photograph</Button>}
               </div>
               {selectionMessage && <p aria-live="polite" className="mt-4 text-sm text-muted-foreground" role="status">{selectionMessage}</p>}
             </div>
@@ -382,11 +383,6 @@ export function ChatPage({
         )}
       </div>
       <div className="mx-auto w-full max-w-2xl pt-4">
-        {isBoundThread && thread.stage !== undefined && thread.status !== undefined && (
-          <div className="mb-2">
-            <SessionStageStrip stage={thread.stage} status={thread.status} workflowType={thread.workflowType} />
-          </div>
-        )}
         {thread.workflowState && (
           <p className={`mb-2 text-xs font-medium ${thread.workflowState === "failed" ? "text-destructive" : "text-muted-foreground"}`} role="status">
             Workflow: {workflowStateLabels[thread.workflowState]}
@@ -397,7 +393,6 @@ export function ChatPage({
           canSend={canSend}
           disabledReason={sendDisabledReason}
           draft={draft}
-          isSelecting={selecting}
           isSending={isSending}
           onDraftChange={(nextDraft) => onDraftChange(threadId, nextDraft)}
           onSend={() => onSend(threadId)}

@@ -17,6 +17,7 @@ import {
   chatMessageAppendRequestSchema,
   chatSessionCreateRequestSchema,
   chatSessionIdSchema,
+  conversationCreateRequestSchema,
   sessionActivityEventSchema,
 } from "../shared/contracts";
 
@@ -44,6 +45,7 @@ let localSigningSecret: string | undefined;
 const managedServiceCookieUrl = "http://127.0.0.1/";
 const localServiceFrameLimitBytes = 1024 * 1024;
 const localServiceRequestTimeoutMs = 5_000;
+const localConversationRequestTimeoutMs = 190_000;
 let localServiceCapability: string | undefined;
 let localServiceVerified = false;
 let startingLocalService = false;
@@ -754,6 +756,7 @@ async function requestLocalService(request: LocalServiceRequest): Promise<LocalS
     }
     case "chatGetSession":
     case "chatListMessages":
+    case "chatCreateConversation":
     case "chatAppendMessage": {
       if (!chatSessionIdSchema.safeParse(request.sessionId).success) {
         throw new Error("The local service request is not allowed.");
@@ -764,11 +767,17 @@ async function requestLocalService(request: LocalServiceRequest): Promise<LocalS
       } else if (request.operation === "chatListMessages") {
         path = `/chat/sessions/${request.sessionId}/messages`;
         init = { method: "GET" };
+      } else if (request.operation === "chatCreateConversation") {
+        if (!conversationCreateRequestSchema.safeParse(request.request).success) {
+          throw new Error("The local service request is not allowed.");
+        }
+        path = `/chat/sessions/${request.sessionId}/conversation`;
+        init = { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(request.request) };
       } else {
         if (!chatMessageAppendRequestSchema.safeParse(request.request).success) {
           throw new Error("The local service request is not allowed.");
         }
-        path = `/chat/sessions/${request.sessionId}/messages`;
+        path = `/sessions/${request.sessionId}/messages`;
         init = { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(request.request) };
       }
       break;
@@ -786,7 +795,12 @@ async function requestLocalService(request: LocalServiceRequest): Promise<LocalS
     "X-Workbench-Capability": localServiceCapability,
     ...(cookieHeader ? { Cookie: cookieHeader } : {}),
     ...(init.headers as Record<string, string> | undefined),
-  }, typeof init.body === "string" ? init.body : undefined, filePath, filePath ? 120_000 : localServiceRequestTimeoutMs);
+  }, typeof init.body === "string" ? init.body : undefined, filePath,
+  filePath
+    ? 120_000
+    : request.operation === "chatCreateConversation"
+      ? localConversationRequestTimeoutMs
+      : localServiceRequestTimeoutMs);
   for (const [name, value] of response.headers) {
     if (name.toLowerCase() !== "set-cookie") continue;
     const [pair, ...attributes] = value.split(";").map((part) => part.trim());

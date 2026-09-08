@@ -78,12 +78,30 @@ const messagePayload = {
   clientMessageId: "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
 };
 
-/** The Phase 4 workflow-admission acknowledgement is not the chat append response. */
 const queuedWorkAckPayload = {
   messageId: messagePayload.messageId,
   workflowRunId: "3ef46b0e-7c1a-4d9e-9f2a-3f5c6b7d8e92",
   status: "queued",
   eventsUrl: `/sessions/${sessionPayload.sessionId}/events`,
+};
+
+const conversationPayload = {
+  sessionId: sessionPayload.sessionId,
+  userMessageId: messagePayload.messageId,
+  assistantMessageId: "9ef46b0e-7c1a-4d9e-9f2a-3f5c6b7d8e97",
+  assistantText: "I am the approved local Qwen model.",
+  selectedModel: "qwen3:4b",
+  usedFallback: false,
+  fallbackReason: null,
+  metrics: {
+    clientElapsedMs: 125.5,
+    totalDurationNs: null,
+    loadDurationNs: null,
+    promptEvalCount: 12,
+    promptEvalDurationNs: null,
+    evalCount: 9,
+    evalDurationNs: null,
+  },
 };
 
 test("current FastAPI ready health responses parse into the canonical contract", async () => {
@@ -261,15 +279,58 @@ test("malformed chat payloads are rejected instead of trusted", async () => {
   }
 });
 
-test("append responses are validated as stored chat messages, not queued-work acks", async () => {
+test("append responses are validated as Phase 4 queued-work acknowledgements", async () => {
   installBridge({ requestLocalService: async () => ok(queuedWorkAckPayload) });
-  await assert.rejects(
-    localApi.appendChatMessage(sessionPayload.sessionId, {
-      content: "Find the corrosion findings.",
-      clientMessageId: "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
-      selectedUploadIds: [],
+  const acknowledgement = await localApi.appendChatMessage(sessionPayload.sessionId, {
+    content: "Find the corrosion findings.",
+    clientMessageId: "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
+    selectedUploadIds: [],
+  });
+  assert.equal(acknowledgement.workflowRunId, queuedWorkAckPayload.workflowRunId);
+  assert.equal(acknowledgement.status, "queued");
+});
+
+test("ordinary conversation responses use the distinct text-only operation", async () => {
+  let observed: LocalServiceRequest | undefined;
+  installBridge({
+    requestLocalService: async (request) => {
+      observed = request;
+      return ok(conversationPayload);
+    },
+  });
+
+  const response = await localApi.createConversationTurn(sessionPayload.sessionId, {
+    message: "Hello, what model is this?",
+    clientRequestId: messagePayload.clientMessageId,
+  });
+
+  assert.equal(response.selectedModel, "qwen3:4b");
+  assert.equal(response.assistantText, conversationPayload.assistantText);
+  assert.deepEqual(observed, {
+    operation: "chatCreateConversation",
+    sessionId: sessionPayload.sessionId,
+    request: {
+      message: "Hello, what model is this?",
+      clientRequestId: messagePayload.clientMessageId,
+    },
+  });
+});
+
+test("ordinary conversation error codes remain available for actionable UI messages", async () => {
+  installBridge({
+    requestLocalService: async () => ({
+      status: 503,
+      body: JSON.stringify({ code: "ollama_unavailable", message: "The local Ollama service is unavailable." }),
     }),
-    (error: unknown) => error instanceof LocalApiError && error.kind === "invalidResponse",
+  });
+
+  await assert.rejects(
+    localApi.createConversationTurn(sessionPayload.sessionId, { message: "Hello" }),
+    (error: unknown) =>
+      error instanceof LocalApiError &&
+      error.kind === "http" &&
+      error.status === 503 &&
+      error.code === "ollama_unavailable",
   );
 });
 
@@ -320,7 +381,7 @@ test("create and append round-trip the request bodies to the local service", asy
       if (request.operation === "chatCreateSession") {
         return ok(sessionPayload);
       }
-      return ok(messagePayload);
+      return ok(request.operation === "chatAppendMessage" ? queuedWorkAckPayload : messagePayload);
     },
   });
 
@@ -329,15 +390,14 @@ test("create and append round-trip the request bodies to the local service", asy
     title: "Inspection review",
     clientSessionId: "4ef46b0e-7c1a-4d9e-9f2a-3f5c6b7d8e92",
   });
-  const appended = await localApi.appendChatMessage(sessionPayload.sessionId, {
+  const admitted = await localApi.appendChatMessage(sessionPayload.sessionId, {
     content: "Find the corrosion findings.",
     clientMessageId: "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
     selectedUploadIds: ["5ef46b0e-7c1a-4d9e-9f2a-3f5c6b7d8e93"],
   });
   assert.equal(created.sessionId, sessionPayload.sessionId);
-  assert.equal(appended.messageId, messagePayload.messageId);
-  assert.equal(appended.role, "user");
-  assert.equal(appended.clientMessageId, messagePayload.clientMessageId);
+  assert.equal(admitted.messageId, queuedWorkAckPayload.messageId);
+  assert.equal(admitted.workflowRunId, queuedWorkAckPayload.workflowRunId);
   assert.deepEqual(requests[0], {
     operation: "chatCreateSession",
     request: {

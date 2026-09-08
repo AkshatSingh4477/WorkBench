@@ -1,10 +1,12 @@
 import type {
-  ChatMessage,
   ChatMessageAppendRequest,
   ChatMessageListResponse,
   ChatSession,
   ChatSessionCreateRequest,
   ChatSessionListResponse,
+  ChatErrorCode,
+  ConversationCreateRequest,
+  ConversationCreateResponse,
   EmployeeLoginRequest,
   EmployeeLoginResponse,
   EmployeeLogoutResponse,
@@ -12,20 +14,23 @@ import type {
   EmployeeSessionRestoreResponse,
   HealthResponse,
   LocalServiceRequest,
+  WorkflowMessageAcceptedResponse,
   WorkflowUploadResponse,
 } from "../../shared/contracts";
 import {
   chatErrorCodeSchema,
   chatMessageListResponseSchema,
-  chatMessageSchema,
   chatSessionListResponseSchema,
   chatSessionSchema,
+  conversationCreateResponseSchema,
   healthResponseSchema,
+  workflowMessageAcceptedResponseSchema,
   workflowUploadResponseSchema,
 } from "../../shared/contracts.ts";
 import type { ZodType } from "zod";
 
 const requestTimeoutMs = 5_000;
+const conversationRequestTimeoutMs = 195_000;
 
 export type LocalApiErrorKind =
   | "invalidUrl"
@@ -42,12 +47,14 @@ export type LocalApiErrorKind =
 export class LocalApiError extends Error {
   readonly kind: LocalApiErrorKind;
   readonly status: number | undefined;
+  readonly code: ChatErrorCode | undefined;
 
-  constructor(message: string, kind: LocalApiErrorKind, status?: number) {
+  constructor(message: string, kind: LocalApiErrorKind, status?: number, code?: ChatErrorCode) {
     super(message);
     this.name = "LocalApiError";
     this.kind = kind;
     this.status = status;
+    this.code = code;
   }
 }
 
@@ -160,16 +167,17 @@ export class LocalApiClient {
           timeout = window.setTimeout(() => reject(new LocalApiError(`FastAPI ${operation} timed out.`, "timeout")), timeoutMs);
         }),
       ]);
-      if (response.status === 401 || response.status === 403) throw new LocalApiError(`The local employee ${operation} was not authorized.`, "unauthorized", response.status);
+      const parsedErrorCode = chatErrorCodeSchema.safeParse(parseErrorCode(response.body));
+      const errorCode = parsedErrorCode.success ? parsedErrorCode.data : undefined;
+      if (response.status === 401 || response.status === 403) throw new LocalApiError(`The local employee ${operation} was not authorized.`, "unauthorized", response.status, errorCode);
       if (response.status === 404) {
-        const errorCode = chatErrorCodeSchema.safeParse(parseErrorCode(response.body));
-        if (errorCode.success && errorCode.data === "session_not_found") {
-          throw new LocalApiError("The chat session was not found for this employee.", "resourceNotFound", response.status);
+        if (errorCode === "session_not_found") {
+          throw new LocalApiError("The chat session was not found for this employee.", "resourceNotFound", response.status, errorCode);
         }
-        throw new LocalApiError(`The local employee ${operation} endpoint is unavailable on FastAPI.`, "endpointUnavailable", response.status);
+        throw new LocalApiError(`The local employee ${operation} endpoint is unavailable on FastAPI.`, "endpointUnavailable", response.status, errorCode);
       }
       if ((response.status < 200 || response.status >= 300) && !acceptedStatuses.includes(response.status)) {
-        throw new LocalApiError(`FastAPI ${operation} returned HTTP ${response.status}.`, "http", response.status);
+        throw new LocalApiError(`FastAPI ${operation} returned HTTP ${response.status}.`, "http", response.status, errorCode);
       }
       try {
         return { status: response.status, value: JSON.parse(response.body) as unknown };
@@ -271,12 +279,29 @@ export class LocalApiClient {
     sessionId: string,
     request: ChatMessageAppendRequest,
     apiBaseUrl?: string,
-  ): Promise<ChatMessage> {
+  ): Promise<WorkflowMessageAcceptedResponse> {
     void apiBaseUrl;
     return parseChat(
-      chatMessageSchema,
-      await this.requestJson({ operation: "chatAppendMessage", sessionId, request }, "chat message"),
-      "chat message",
+      workflowMessageAcceptedResponseSchema,
+      await this.requestJson({ operation: "chatAppendMessage", sessionId, request }, "workflow message admission"),
+      "workflow message admission",
+    );
+  }
+
+  async createConversationTurn(
+    sessionId: string,
+    request: ConversationCreateRequest,
+    apiBaseUrl?: string,
+  ): Promise<ConversationCreateResponse> {
+    void apiBaseUrl;
+    return parseChat(
+      conversationCreateResponseSchema,
+      await this.requestJson(
+        { operation: "chatCreateConversation", sessionId, request },
+        "local conversation",
+        conversationRequestTimeoutMs,
+      ),
+      "local conversation",
     );
   }
 

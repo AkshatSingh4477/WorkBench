@@ -39,10 +39,24 @@ test("main-process service traffic uses the child-owned pipe", () => {
   );
   assert.match(
     main,
-    /chatMessageAppendRequestSchema[\s\S]*?path = `\/chat\/sessions\/\$\{request\.sessionId\}\/messages`;\s+init = \{ method: "POST"/,
+    /chatMessageAppendRequestSchema[\s\S]*?path = `\/sessions\/\$\{request\.sessionId\}\/messages`;\s+init = \{ method: "POST"/,
+  );
+  assert.match(
+    main,
+    /request\.operation === "chatCreateConversation"[\s\S]*?conversationCreateRequestSchema[\s\S]*?path = `\/chat\/sessions\/\$\{request\.sessionId\}\/conversation`;\s+init = \{ method: "POST"/,
   );
   assert.match(main, /path: `\/sessions\/\$\{sessionId\}\/events`/);
   assert.match(main, /localServiceStartAttempts = 3/);
+});
+
+test("ordinary composer sends text through conversation and reloads persisted messages", () => {
+  const hook = readFileSync(new URL("../src/renderer/hooks/useChatThreads.ts", import.meta.url), "utf8");
+
+  assert.match(hook, /localApi\.createConversationTurn\(/);
+  assert.match(hook, /clientRequestId: clientMessageId/);
+  assert.match(hook, /await localApi\.listChatMessages\(sessionId, apiBaseUrl\)/);
+  assert.doesNotMatch(hook, /localApi\.appendChatMessage\(/);
+  assert.doesNotMatch(hook, /localApi\.uploadWorkflowFile\(/);
 });
 
 test("child-pipe requests time out and restart the managed service", () => {

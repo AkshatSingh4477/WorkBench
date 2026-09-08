@@ -100,6 +100,7 @@ export type LocalServiceRequest =
   | { operation: "chatCreateSession"; request: ChatSessionCreateRequest }
   | { operation: "chatGetSession"; sessionId: string }
   | { operation: "chatListMessages"; sessionId: string }
+  | { operation: "chatCreateConversation"; sessionId: string; request: ConversationCreateRequest }
   | { operation: "chatAppendMessage"; sessionId: string; request: ChatMessageAppendRequest }
   | { operation: "workflowUpload"; sessionId: string; uploadToken: string };
 
@@ -354,6 +355,47 @@ export const workflowUploadResponseSchema = z.strictObject({
   createdAt: chatTimestampSchema,
 });
 
+/** Text-only chat request. Workflow inputs and tool fields are intentionally absent. */
+export const conversationCreateRequestSchema = z.strictObject({
+  message: z
+    .string()
+    .min(1)
+    .max(20_000)
+    .refine((message) => message.trim().length > 0, { message: "message must not be blank" }),
+  /** Stable per-attempt idempotency key; retries reuse it instead of duplicating a turn. */
+  clientRequestId: uuidSchema.optional(),
+});
+
+export const inferenceMetricsSchema = z.strictObject({
+  clientElapsedMs: z.number().nonnegative(),
+  totalDurationNs: z.number().int().nonnegative().nullable(),
+  loadDurationNs: z.number().int().nonnegative().nullable(),
+  promptEvalCount: z.number().int().nonnegative().nullable(),
+  promptEvalDurationNs: z.number().int().nonnegative().nullable(),
+  evalCount: z.number().int().nonnegative().nullable(),
+  evalDurationNs: z.number().int().nonnegative().nullable(),
+});
+
+/** One complete local conversation turn after both messages have been persisted. */
+export const conversationCreateResponseSchema = z.strictObject({
+  sessionId: uuidSchema,
+  userMessageId: uuidSchema,
+  assistantMessageId: uuidSchema,
+  assistantText: z.string().min(1).max(20_000),
+  selectedModel: z.string().min(1),
+  usedFallback: z.boolean(),
+  fallbackReason: z.string().nullable(),
+  metrics: inferenceMetricsSchema.nullable(),
+});
+
+/** Durable Phase 4 workflow admission; completion arrives through session events. */
+export const workflowMessageAcceptedResponseSchema = z.strictObject({
+  messageId: uuidSchema,
+  workflowRunId: uuidSchema,
+  status: z.literal("queued"),
+  eventsUrl: z.string().regex(/^\/sessions\/[0-9a-f-]{36}\/events$/),
+});
+
 export const activityEventTypeSchema = z.enum([
   "session.created",
   "upload.accepted",
@@ -386,7 +428,16 @@ export type SessionEventStreamUpdate =
 /** The renderer may build paths only from server-issued session IDs. */
 export const chatSessionIdSchema = uuidSchema;
 
-export const chatErrorCodeSchema = z.enum(["session_not_found"]);
+export const chatErrorCodeSchema = z.enum([
+  "session_not_found",
+  "session_not_active",
+  "conversation_conflict",
+  "conversation_too_large",
+  "generation_timeout",
+  "invalid_ai_response",
+  "ollama_unavailable",
+  "text_model_unavailable",
+]);
 
 export type ChatWorkflowType = z.infer<typeof chatWorkflowTypeSchema>;
 
@@ -407,5 +458,9 @@ export type ChatMessageListResponse = z.infer<typeof chatMessageListResponseSche
 export type ChatSessionCreateRequest = z.infer<typeof chatSessionCreateRequestSchema>;
 
 export type ChatMessageAppendRequest = z.infer<typeof chatMessageAppendRequestSchema>;
+export type ConversationCreateRequest = z.infer<typeof conversationCreateRequestSchema>;
+export type ConversationCreateResponse = z.infer<typeof conversationCreateResponseSchema>;
+export type ChatErrorCode = z.infer<typeof chatErrorCodeSchema>;
 export type WorkflowUploadResponse = z.infer<typeof workflowUploadResponseSchema>;
+export type WorkflowMessageAcceptedResponse = z.infer<typeof workflowMessageAcceptedResponseSchema>;
 export type SessionActivityEvent = z.infer<typeof sessionActivityEventSchema>;
