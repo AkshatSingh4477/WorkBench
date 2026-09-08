@@ -2,7 +2,8 @@
 
 import pytest
 
-from app.ai.errors import ConversationContextTooLarge
+import app.ai.generation.conversation as conversation_module
+from app.ai.errors import ConversationContextTooLarge, InvalidStructuredOutput
 from app.ai.evaluation.samples import sample_inference_metrics, sample_model_profile
 from app.ai.generation.conversation import LocalConversationGenerator
 from app.ai.models.ports import ModelAdapter
@@ -25,8 +26,12 @@ from app.ai.schemas import (
 class RecordingConversationAdapter:
     """Capture conversation requests without contacting a local model runtime."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        results: tuple[ConversationGenerationResult | InvalidStructuredOutput, ...] = (),
+    ) -> None:
         self.requests: list[ConversationGenerationRequest] = []
+        self.results = list(results)
 
     async def list_models(self) -> tuple[InstalledModel, ...]:
         return ()
@@ -43,6 +48,11 @@ class RecordingConversationAdapter:
         self, request: ConversationGenerationRequest
     ) -> ConversationGenerationResult:
         self.requests.append(request)
+        if self.results:
+            result = self.results.pop(0)
+            if isinstance(result, InvalidStructuredOutput):
+                raise result
+            return result
         return ConversationGenerationResult(
             model=request.model,
             text="The local answer is ready.",
@@ -97,6 +107,12 @@ async def test_local_conversation_passes_exact_history_and_current_message() -> 
     assert request.model == "qwen3:4b"
     assert request.timeout_seconds == 30
     assert request.temperature == 0.2
+    assert request.assistant_name == "WorkBench"
+    assert request.disclose_runtime_model is True
+    assert "local-conversation-v2" in request.system_prompt
+    assert "pretrained knowledge" in request.system_prompt
+    assert "official authority" in request.system_prompt
+    assert "Who is the prime minister" not in request.system_prompt
     assert request.messages == (
         ConversationMessage(role="user", content="Remember the valve identifier V-17."),
         ConversationMessage(role="assistant", content="I will use V-17 in this chat."),
@@ -154,3 +170,91 @@ async def test_local_conversation_rejects_context_over_budget_without_a_model_ca
         )
 
     assert adapter.requests == []
+
+
+async def test_local_conversation_retries_invalid_output_once_without_changing_history() -> None:
+    """Ask for one corrected final answer, then return only the validated retry."""
+
+    first_error = InvalidStructuredOutput(
+        "reasoning leaked into the conversation answer",
+        model="qwen3:1.7b",
+        metrics=sample_inference_metrics(),
+        fallback_reason="Preferred model could not run; tried qwen3:1.7b.",
+    )
+    adapter = RecordingConversationAdapter(
+        (
+            first_error,
+            ConversationGenerationResult(
+                model="qwen3:1.7b",
+                text="I am WorkBench, running locally with qwen3:1.7b.",
+                metrics=sample_inference_metrics(),
+            ),
+        )
+    )
+    generator = LocalConversationGenerator(adapter, sample_model_profile())
+
+    reply = await generator.reply(
+        ConversationRequest(session_id="session-chat-retry", user_message="Introduce yourself."),
+        model="qwen3:4b",
+    )
+
+    assert len(adapter.requests) == 2
+    assert adapter.requests[0].messages == adapter.requests[1].messages
+    assert "previous response was invalid" not in adapter.requests[0].system_prompt.lower()
+    assert "previous response was invalid" in adapter.requests[1].system_prompt.lower()
+    assert adapter.requests[1].model == "qwen3:1.7b"
+    assert reply.model == "qwen3:1.7b"
+    assert reply.used_fallback is True
+    assert reply.fallback_reason == first_error.fallback_reason
+
+
+async def test_local_conversation_retry_uses_only_the_remaining_request_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The correction attempt must not restart the caller's timeout budget."""
+
+    clock = iter((100.0, 106.0))
+    monkeypatch.setattr(conversation_module, "perf_counter", lambda: next(clock))
+    adapter = RecordingConversationAdapter(
+        (
+            InvalidStructuredOutput("first invalid response"),
+            ConversationGenerationResult(
+                model="qwen3:4b",
+                text="Corrected final answer.",
+                metrics=sample_inference_metrics(),
+            ),
+        )
+    )
+    generator = LocalConversationGenerator(adapter, sample_model_profile())
+
+    reply = await generator.reply(
+        ConversationRequest(
+            session_id="session-chat-deadline",
+            user_message="Hello.",
+            timeout_seconds=10,
+        ),
+        model="qwen3:4b",
+    )
+
+    assert reply.assistant_text == "Corrected final answer."
+    assert [request.timeout_seconds for request in adapter.requests] == [10, 4]
+
+
+async def test_local_conversation_stops_after_the_second_invalid_output() -> None:
+    """Never guess an answer after the one allowed correction attempt."""
+
+    adapter = RecordingConversationAdapter(
+        (
+            InvalidStructuredOutput("first invalid response"),
+            InvalidStructuredOutput("second invalid response"),
+        )
+    )
+    generator = LocalConversationGenerator(adapter, sample_model_profile())
+
+    with pytest.raises(InvalidStructuredOutput, match="second invalid response"):
+        await generator.reply(
+            ConversationRequest(session_id="session-chat-invalid", user_message="Hello."),
+            model="qwen3:4b",
+        )
+
+    assert len(adapter.requests) == 2
